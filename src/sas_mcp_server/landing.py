@@ -79,7 +79,7 @@ PAGE_TITLE = "SAS Viya MCP Server"
 class ToolEntry:
     name: str
     summary: str
-    # From the tool's MCP annotations (readOnlyHint / destructiveHint); None
+    # From the tool's MCP annotations (read_only_hint / destructive_hint); None
     # when the tool carries none, so the page never invents a classification.
     read_only: bool | None = None
     destructive: bool | None = None
@@ -183,6 +183,25 @@ def summarize(description: str | None, *, max_len: int = _SUMMARY_MAX) -> str:
     return text
 
 
+def _hint(annotations: Any, field: str) -> bool | None:
+    """Read one MCP tool annotation, or ``None`` when the tool carries none.
+
+    The field name is passed in rather than accessed inline because ``getattr``
+    with a ``None`` default cannot tell "this tool declares nothing" from "this
+    field no longer exists", so a rename upstream would blank every badge on the
+    page instead of failing. MCP SDK v2 renamed these from camelCase once
+    already; :data:`_READ_ONLY_HINT` and :data:`_DESTRUCTIVE_HINT` are asserted
+    against the model in test_landing.py so a second rename fails a test.
+    """
+    if annotations is None:
+        return None
+    return getattr(annotations, field, None)
+
+
+_READ_ONLY_HINT = "read_only_hint"
+_DESTRUCTIVE_HINT = "destructive_hint"
+
+
 async def collect_facts(
     mcp: Any,
     *,
@@ -211,8 +230,8 @@ async def collect_facts(
             ToolEntry(
                 name=t.name,
                 summary=summarize(t.description),
-                read_only=getattr(ann, "readOnlyHint", None),
-                destructive=getattr(ann, "destructiveHint", None),
+                read_only=_hint(ann, _READ_ONLY_HINT),
+                destructive=_hint(ann, _DESTRUCTIVE_HINT),
             )
         )
     groups: list[TierGroup] = []

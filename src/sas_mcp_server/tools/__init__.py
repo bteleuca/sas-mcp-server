@@ -95,7 +95,7 @@ class _TierRecorder:
       page.
     * ``annotations=`` is filled in from :func:`annotations_for` (the central
       read/write classification) unless the tier passed its own, so every tool
-      advertises ``readOnlyHint`` & co. to clients without any per-tool code.
+      advertises ``read_only_hint`` & co. to clients without any per-tool code.
     """
 
     def __init__(self, target: Any, tier: int) -> None:
