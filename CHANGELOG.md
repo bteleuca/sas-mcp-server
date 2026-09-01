@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-09-01
+
 ### Changed
 - **Upgraded to FastMCP 4.0, which is now the minimum.** The pin moves from `fastmcp>=3.0.0,<4.0.0` to `fastmcp>=4.0.0,<5.0.0`, bringing `mcp` 2.x and FastMCP 4's HTTP client, `httpx2`, alongside the `httpx` this project uses directly. FastMCP 4.0 needs no changes to how tools, prompts, middleware, tiers, read-only mode or the OAuth proxy are written — the whole test suite passes on it unaltered. **This is not a drop-in for an existing checkout: `uv sync` (or a container rebuild) is required, and running this code against FastMCP 3.x is no longer supported** — see the annotation rename below for why that combination fails quietly rather than loudly.
 - **Tool annotations now use the MCP SDK v2 snake_case field names** (`read_only_hint`, `destructive_hint`, `idempotent_hint`, `open_world_hint`, and `input_schema` in the tests), matching the rename in the SDK that ships with FastMCP 4. **Clients are unaffected:** the wire format is still the spec's camelCase (`readOnlyHint` and friends), because SDK v2 keeps those as serialization aliases — verified against a real `tools/list` response, where all 75 tools carry the camelCase keys and 43 report `readOnlyHint: true` exactly as before.
