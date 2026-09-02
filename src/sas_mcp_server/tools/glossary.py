@@ -17,10 +17,11 @@ tool here returns both ids under fixed names (``term_id`` and
 
 **Attributes are keyed by UUID.** A term's ``attributes`` map is
 ``{attribute-definition-uuid: value}``; the human label lives on the *term type*.
-Returned raw it is unreadable, and unwriteable without a second lookup. These
-tools resolve UUID→label on read and label→UUID on write, validating against the
-type's declared required-ness and allowed values, so a caller works in the
-vocabulary the glossary UI shows.
+Returned raw it is unreadable, and unwriteable without a second lookup. The
+translation both ways, and the validation against the type's declared
+required-ness and allowed values, live in
+:mod:`sas_mcp_server.helpers.glossary_helpers` — as do the other pure transforms
+here, so the rules can be read without the request plumbing around them.
 
 **Term↔asset links are catalog relationships**, not glossary objects. A
 ``glossaryTermAsset`` relationship joins the term entity (always ``endpoint1``)
@@ -32,7 +33,6 @@ traversal silently finds nothing rather than failing.
 """
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
@@ -41,10 +41,19 @@ from fastmcp import Context, FastMCP
 from pydantic import BeforeValidator
 
 from ..config import VIYA_ENDPOINT
+from ..helpers.glossary_helpers import (
+    attribute_maps,
+    chunk_ids,
+    encode_attributes,
+    glossary_id_from_resource,
+    readable_attributes,
+)
 from ..viya_client import (
     JSONDict,
     delete_resource,
+    filter_literal,
     get_json,
+    in_filter,
     post_json,
     put_json,
     raise_for_viya_status,
@@ -76,144 +85,6 @@ _TERM_ASSET_DEFINITION = "glossaryTermAsset"
 # with "The indices \"term\" cannot be found."
 _TERMS_INDEX = "terms"
 _DATASETS_INDEX = "datasets"
-
-# Viya filters travel in the query string, so a few hundred UUIDs would build a
-# URL the gateway rejects. Batched id lookups are chunked to stay inside that.
-_ID_CHUNK = 40
-
-_TERM_RESOURCE_RE = re.compile(r"/glossary/terms/([^/]+)$")
-
-
-def _quote(value: str) -> str:
-    """Escape a value for a Viya filter string literal (single quotes double)."""
-    return (value or "").replace("'", "''")
-
-
-def _in_filter(field: str, values: list[str]) -> str:
-    """Build ``in(field,'a','b',...)`` for a batched lookup."""
-    joined = "','".join(_quote(v) for v in values)
-    return f"in({field},'{joined}')"
-
-
-def _chunks(values: list[str], size: int | None = None) -> list[list[str]]:
-    """Split *values* into batches small enough for one filter expression.
-
-    The default is read at call time rather than bound into the signature, so
-    :data:`_ID_CHUNK` stays the single place the batch size is defined.
-    """
-    size = size or _ID_CHUNK
-    return [values[i : i + size] for i in range(0, len(values), size)]
-
-
-def _glossary_id_from_resource(resource_id: str | None) -> str | None:
-    """Pull the glossary term id out of a catalog entity's ``resourceId``."""
-    match = _TERM_RESOURCE_RE.search(resource_id or "")
-    return match.group(1) if match else None
-
-
-def _attribute_maps(term_type: JSONDict) -> tuple[dict[str, str], dict[str, JSONDict]]:
-    """Return ``(uuid -> label, lowercased label -> definition)`` for a term type.
-
-    Labels are matched case-insensitively on write because they are display
-    strings a caller reads off a screen, not identifiers.
-    """
-    by_uuid: dict[str, str] = {}
-    by_label: dict[str, JSONDict] = {}
-    for definition in term_type.get("attributes", []) or []:
-        uuid = definition.get("name", "")
-        label = definition.get("label", "") or uuid
-        if uuid:
-            by_uuid[uuid] = label
-            by_label[label.strip().lower()] = definition
-    return by_uuid, by_label
-
-
-def _readable_attributes(raw: dict[str, Any] | None, by_uuid: dict[str, str]) -> dict[str, Any]:
-    """Re-key a term's ``attributes`` map from UUIDs to their labels.
-
-    Empty values are dropped: the glossary stores every declared attribute on
-    every term, so keeping them would bury the two or three actually filled in.
-    A UUID with no matching definition is kept under the UUID rather than
-    discarded, so nothing is silently lost when a term type has been edited.
-    """
-    readable: dict[str, Any] = {}
-    for uuid, value in (raw or {}).items():
-        if value in (None, ""):
-            continue
-        readable[by_uuid.get(uuid, uuid)] = value
-    return readable
-
-
-def _encode_attribute(value: Any, definition: JSONDict) -> str:
-    """Coerce one attribute value to the string form the glossary stores.
-
-    Every attribute value is a string on the wire, booleans and dates included.
-    Passing a real bool or number is accepted by the API but stores ``True`` or
-    ``1``, which the glossary UI then displays verbatim.
-    """
-    # An empty value clears the attribute, which is how the glossary itself
-    # stores an unset one. It has to bypass the checks below, or a required
-    # single-select could be set once and never cleared again.
-    if value is None or value == "":
-        return ""
-    attr_type = (definition.get("type") or "").lower()
-    if attr_type == "boolean":
-        if isinstance(value, bool):
-            return "true" if value else "false"
-        text = str(value).strip().lower()
-        if text not in ("true", "false"):
-            raise ValueError(
-                f"attribute '{definition.get('label')}' is a boolean; got {value!r}. "
-                "Pass true or false."
-            )
-        return text
-    text = str(value)
-    if attr_type == "single-select":
-        allowed = definition.get("items") or []
-        if allowed and text not in allowed:
-            raise ValueError(
-                f"attribute '{definition.get('label')}' only accepts {allowed}; got {text!r}."
-            )
-    return text
-
-
-def _encode_attributes(
-    supplied: dict[str, Any] | None,
-    by_label: dict[str, JSONDict],
-    *,
-    require_all: bool,
-) -> dict[str, str]:
-    """Map a caller's label-keyed attributes onto the UUID keys the API wants.
-
-    Raises :class:`ValueError` naming the valid labels for an unknown one and —
-    when *require_all* (a create, where there is nothing to fall back on) —
-    naming the required attributes that were not supplied. Both are mistakes a
-    model can correct from the message alone, which a bare HTTP 400 does not
-    allow.
-    """
-    encoded: dict[str, str] = {}
-    for label, value in (supplied or {}).items():
-        definition = by_label.get(label.strip().lower())
-        if definition is None:
-            valid = sorted(d.get("label", "") for d in by_label.values())
-            raise ValueError(
-                f"unknown attribute '{label}' for this term type. Valid attributes: "
-                f"{valid or 'none — this term type declares no custom attributes'}. "
-                "get_glossary_term_type lists each one's type and allowed values."
-            )
-        encoded[definition["name"]] = _encode_attribute(value, definition)
-    if require_all:
-        missing = sorted(
-            d.get("label", "")
-            for d in by_label.values()
-            if d.get("required") and d["name"] not in encoded
-        )
-        if missing:
-            raise ValueError(
-                f"this term type requires attribute(s) {missing}, which were not supplied. "
-                "get_glossary_term_type lists each one's type and allowed values."
-            )
-    return encoded
 
 
 def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> None:
@@ -289,9 +160,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
     async def entities_by_id(client: httpx.AsyncClient, ids: list[str]) -> dict[str, JSONDict]:
         """Batch-resolve catalog entity ids to their full entity representations."""
         found: dict[str, JSONDict] = {}
-        for chunk in _chunks(sorted({i for i in ids if i})):
+        for chunk in chunk_ids(sorted({i for i in ids if i})):
             for item in await instance_collection(
-                client, _in_filter("id", chunk), len(chunk) + 10, _ENTITY_MEDIA
+                client, in_filter("id", chunk), len(chunk) + 10, _ENTITY_MEDIA
             ):
                 found[item["id"]] = item
         return found
@@ -301,12 +172,12 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
     ) -> dict[str, JSONDict]:
         """Batch-resolve glossary term ids to their catalog term entities."""
         found: dict[str, JSONDict] = {}
-        for chunk in _chunks(sorted({i for i in glossary_ids if i})):
+        for chunk in chunk_ids(sorted({i for i in glossary_ids if i})):
             resources = [f"/glossary/terms/{gid}" for gid in chunk]
             for item in await instance_collection(
-                client, _in_filter("resourceId", resources), len(chunk) + 10, _ENTITY_MEDIA
+                client, in_filter("resourceId", resources), len(chunk) + 10, _ENTITY_MEDIA
             ):
-                gid = _glossary_id_from_resource(item.get("resourceId"))
+                gid = glossary_id_from_resource(item.get("resourceId"))
                 if gid:
                     found[gid] = item
         return found
@@ -321,10 +192,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         trip per link for the same answer.
         """
         rels: list[JSONDict] = []
-        for chunk in _chunks(sorted({i for i in entity_ids if i})):
+        for chunk in chunk_ids(sorted({i for i in entity_ids if i})):
             expr = (
                 f"and(eq(definition,'{_TERM_ASSET_DEFINITION}'),"
-                f"or({_in_filter('endpoint1Id', chunk)},{_in_filter('endpoint2Id', chunk)}))"
+                f"or({in_filter('endpoint1Id', chunk)},{in_filter('endpoint2Id', chunk)}))"
             )
             rels.extend(await instance_collection(client, expr, 500, _RELATIONSHIP_MEDIA))
         return rels
@@ -335,7 +206,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         """Resolve a table to its catalog entity, by resource URI or by name."""
         if resource_uri:
             items = await instance_collection(
-                client, f"eq(resourceId,'{_quote(resource_uri)}')", 2, _ENTITY_MEDIA
+                client, f"eq(resourceId,'{filter_literal(resource_uri)}')", 2, _ENTITY_MEDIA
             )
             if not items:
                 raise ValueError(
@@ -378,7 +249,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         """The column entities of a table, keyed off its resource URI."""
         return await instance_collection(
             client,
-            f"startsWith(resourceId,'{_quote(table_resource)}/columns/')",
+            f"startsWith(resourceId,'{filter_literal(table_resource)}/columns/')",
             limit,
             _ENTITY_MEDIA,
         )
@@ -396,7 +267,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         data = await get_json(
             f"{_GLOSSARY}/terms",
             client,
-            params={"filter": f"eq(name,'{_quote(term_name)}')", "start": 0, "limit": 5},
+            params={"filter": f"eq(name,'{filter_literal(term_name)}')", "start": 0, "limit": 5},
             accept=_COLLECTION_MEDIA,
         )
         items = data.get("items", []) or []
@@ -548,7 +419,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 entity = entities.get(hit.get("id", ""), {})
                 items.append(
                     {
-                        "term_id": _glossary_id_from_resource(entity.get("resourceId")),
+                        "term_id": glossary_id_from_resource(entity.get("resourceId")),
                         "catalog_entity_id": hit.get("id"),
                         "name": hit.get("name"),
                         "term_type": hit.get("typeLabel"),
@@ -604,11 +475,11 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             clauses = []
             if term_type:
                 resolved = await resolve_term_type_id(client, term_type)
-                clauses.append(f"eq(termTypeId,'{_quote(resolved)}')")
+                clauses.append(f"eq(termTypeId,'{filter_literal(resolved)}')")
             if parent_id:
-                clauses.append(f"eq(parentId,'{_quote(parent_id)}')")
+                clauses.append(f"eq(parentId,'{filter_literal(parent_id)}')")
             if name_contains:
-                clauses.append(f"contains(name,'{_quote(name_contains)}')")
+                clauses.append(f"contains(name,'{filter_literal(name_contains)}')")
             params: dict[str, Any] = {
                 "start": start,
                 "limit": limit,
@@ -660,7 +531,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 fetch_term_type(client, term.get("termTypeId", "")),
                 term_entities_for(client, [term_id]),
             )
-            by_uuid, _ = _attribute_maps(term_type)
+            by_uuid, _ = attribute_maps(term_type)
             raw_attributes = term.get("attributes") or {}
             return {
                 "term_id": term.get("id"),
@@ -675,7 +546,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "status": term.get("status"),
                 "is_draft": term.get("isDraft", False),
                 "assigned_asset_count": term.get("assetCount", 0),
-                "attributes": _readable_attributes(raw_attributes, by_uuid),
+                "attributes": readable_attributes(raw_attributes, by_uuid),
                 "attribute_ids": raw_attributes,
                 "created_by": term.get("createdBy"),
                 "modified_by": term.get("modifiedBy"),
@@ -804,7 +675,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 entity = term_entities.get(term_entity_id or "", {})
                 per_column[column_id].append(
                     {
-                        "term_id": _glossary_id_from_resource(entity.get("resourceId")),
+                        "term_id": glossary_id_from_resource(entity.get("resourceId")),
                         "catalog_entity_id": term_entity_id,
                         "name": entity.get("name"),
                         "definition": entity.get("description", ""),
@@ -877,8 +748,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         async with viya_session("create_glossary_term", ctx) as client:
             term_type_id = await resolve_term_type_id(client, term_type)
             type_definition = await fetch_term_type(client, term_type_id)
-            by_uuid, by_label = _attribute_maps(type_definition)
-            encoded = _encode_attributes(attributes, by_label, require_all=True)
+            by_uuid, by_label = attribute_maps(type_definition)
+            encoded = encode_attributes(attributes, by_label, require_all=True)
 
             body: dict[str, Any] = {"name": name, "termTypeId": term_type_id}
             if definition is not None:
@@ -906,7 +777,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "status": created.get("status"),
                 "is_draft": created.get("isDraft", False),
                 "parent_id": created.get("parentId"),
-                "attributes": _readable_attributes(created.get("attributes"), by_uuid),
+                "attributes": readable_attributes(created.get("attributes"), by_uuid),
                 "next_step": (
                     "Attach it to data with assign_glossary_term — a term with no assigned "
                     "assets governs nothing."
@@ -945,10 +816,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         async with viya_session("update_glossary_term", ctx) as client:
             current = await get_json(f"{_GLOSSARY}/terms/{term_id}", client, accept=_TERM_MEDIA)
             type_definition = await fetch_term_type(client, current.get("termTypeId", ""))
-            by_uuid, by_label = _attribute_maps(type_definition)
+            by_uuid, by_label = attribute_maps(type_definition)
 
             merged = dict(current.get("attributes") or {})
-            merged.update(_encode_attributes(attributes, by_label, require_all=False))
+            merged.update(encode_attributes(attributes, by_label, require_all=False))
 
             body = {key: value for key, value in current.items() if key != "links"}
             if name is not None:
@@ -973,7 +844,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "name": updated.get("name"),
                 "status": updated.get("status"),
                 "version": updated.get("version"),
-                "attributes": _readable_attributes(updated.get("attributes"), by_uuid),
+                "attributes": readable_attributes(updated.get("attributes"), by_uuid),
             }
 
     @mcp.tool()

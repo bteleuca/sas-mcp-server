@@ -25,6 +25,8 @@ import httpx
 import pytest
 from fastmcp import Client, FastMCP
 
+from sas_mcp_server import viya_client
+from sas_mcp_server.helpers import glossary_helpers as gh
 from sas_mcp_server.tools import glossary
 
 pytestmark = pytest.mark.asyncio
@@ -263,42 +265,42 @@ def _pin_endpoint(monkeypatch):
     monkeypatch.setattr(viya_client, "VIYA_ENDPOINT", VIYA)
 
 
-# --- pure helpers -------------------------------------------------------------
+# --- pure helpers (helpers/glossary_helpers.py) -------------------------------------------------------------
 
 
 def test_quote_doubles_single_quotes():
-    assert glossary._quote("O'Brien") == "O''Brien"
-    assert glossary._quote("") == ""
+    assert viya_client.filter_literal("O'Brien") == "O''Brien"
+    assert viya_client.filter_literal("") == ""
 
 
 def test_in_filter_escapes_each_value():
-    assert glossary._in_filter("id", ["a", "b'c"]) == "in(id,'a','b''c')"
+    assert viya_client.in_filter("id", ["a", "b'c"]) == "in(id,'a','b''c')"
 
 
 def test_chunks_splits_at_the_configured_size():
     values = [str(i) for i in range(95)]
-    chunks = glossary._chunks(values)
+    chunks = gh.chunk_ids(values)
     assert [len(c) for c in chunks] == [40, 40, 15]
     assert [v for c in chunks for v in c] == values
 
 
 def test_glossary_id_is_read_from_the_resource_id():
-    assert glossary._glossary_id_from_resource("/glossary/terms/abc-123") == "abc-123"
+    assert gh.glossary_id_from_resource("/glossary/terms/abc-123") == "abc-123"
     # A table's resourceId must not be mistaken for a term's.
-    assert glossary._glossary_id_from_resource("/dataTables/x/tables/T") is None
-    assert glossary._glossary_id_from_resource(None) is None
+    assert gh.glossary_id_from_resource("/dataTables/x/tables/T") is None
+    assert gh.glossary_id_from_resource(None) is None
 
 
 def test_readable_attributes_names_keys_and_drops_empties():
-    by_uuid, _ = glossary._attribute_maps(TERM_TYPE)
-    readable = glossary._readable_attributes(TERM["attributes"], by_uuid)
+    by_uuid, _ = gh.attribute_maps(TERM_TYPE)
+    readable = gh.readable_attributes(TERM["attributes"], by_uuid)
     assert readable == {"Scope": "Group", "Used in Risk": "true"}
 
 
 def test_readable_attributes_keeps_unknown_uuids():
     """A type edited after the term was written must not lose the term's data."""
-    by_uuid, _ = glossary._attribute_maps(TERM_TYPE)
-    readable = glossary._readable_attributes({"attr-gone": "value"}, by_uuid)
+    by_uuid, _ = gh.attribute_maps(TERM_TYPE)
+    readable = gh.readable_attributes({"attr-gone": "value"}, by_uuid)
     assert readable == {"attr-gone": "value"}
 
 
@@ -308,47 +310,47 @@ def test_readable_attributes_keeps_unknown_uuids():
 )
 def test_boolean_attributes_are_encoded_as_strings(value, expected):
     definition = {"label": "Used in Risk", "type": "boolean"}
-    assert glossary._encode_attribute(value, definition) == expected
+    assert gh.encode_attribute(value, definition) == expected
 
 
 def test_boolean_attribute_rejects_a_non_boolean():
     with pytest.raises(ValueError, match="is a boolean"):
-        glossary._encode_attribute("yes", {"label": "Used in Risk", "type": "boolean"})
+        gh.encode_attribute("yes", {"label": "Used in Risk", "type": "boolean"})
 
 
 def test_single_select_rejects_a_value_outside_the_allowed_list():
     definition = {"label": "Scope", "type": "single-select", "items": ["Local", "Group"]}
     with pytest.raises(ValueError, match=r"only accepts \['Local', 'Group'\]"):
-        glossary._encode_attribute("Regional", definition)
+        gh.encode_attribute("Regional", definition)
 
 
 def test_encode_attributes_maps_labels_case_insensitively():
-    _, by_label = glossary._attribute_maps(TERM_TYPE)
-    encoded = glossary._encode_attributes(
+    _, by_label = gh.attribute_maps(TERM_TYPE)
+    encoded = gh.encode_attributes(
         {"scope": "Local", "USED IN RISK": True}, by_label, require_all=False
     )
     assert encoded == {"attr-scope": "Local", "attr-risk": "true"}
 
 
 def test_encode_attributes_names_the_valid_labels_for_an_unknown_one():
-    _, by_label = glossary._attribute_maps(TERM_TYPE)
+    _, by_label = gh.attribute_maps(TERM_TYPE)
     with pytest.raises(ValueError) as excinfo:
-        glossary._encode_attributes({"Scop": "Local"}, by_label, require_all=False)
+        gh.encode_attributes({"Scop": "Local"}, by_label, require_all=False)
     message = str(excinfo.value)
     assert "unknown attribute 'Scop'" in message
     assert "Scope" in message  # the correction is in the message
 
 
 def test_encode_attributes_requires_mandatory_attributes_on_create():
-    _, by_label = glossary._attribute_maps(TERM_TYPE)
+    _, by_label = gh.attribute_maps(TERM_TYPE)
     with pytest.raises(ValueError, match=r"requires attribute\(s\) \['Scope'\]"):
-        glossary._encode_attributes({"Notes": "x"}, by_label, require_all=True)
+        gh.encode_attributes({"Notes": "x"}, by_label, require_all=True)
 
 
 def test_encode_attributes_does_not_require_them_on_update():
     """An update merges onto what exists, so a required attribute is already set."""
-    _, by_label = glossary._attribute_maps(TERM_TYPE)
-    assert glossary._encode_attributes({"Notes": "x"}, by_label, require_all=False) == {
+    _, by_label = gh.attribute_maps(TERM_TYPE)
+    assert gh.encode_attributes({"Notes": "x"}, by_label, require_all=False) == {
         "attr-note": "x"
     }
 
@@ -601,7 +603,7 @@ async def test_unknown_resource_uri_says_how_to_find_the_right_one():
 
 async def test_column_lookup_is_chunked_for_a_wide_table(monkeypatch):
     """A 200-column table must not build one filter the gateway would reject."""
-    monkeypatch.setattr(glossary, "_ID_CHUNK", 5)
+    monkeypatch.setattr(gh, "ID_CHUNK", 5)
     fake = FakeViya()
     wide = {
         f"cent-w{i}": {

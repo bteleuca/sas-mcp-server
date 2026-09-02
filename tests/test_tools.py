@@ -16,8 +16,10 @@ from sas_mcp_server.helpers import auto_ml_helpers
 from sas_mcp_server.viya_client import (
     contains_filter,
     delete_resource,
+    filter_literal,
     get_json,
     get_paged_items,
+    in_filter,
     make_client,
     post_json,
     put_json,
@@ -332,6 +334,39 @@ def test_contains_filter_basic():
 def test_contains_filter_escapes_single_quotes():
     """A single quote is doubled so the Viya filter stays well-formed (no HTTP 400)."""
     assert contains_filter("O'Brien") == "contains(name,'O''Brien')"
+
+
+# ---------------------------------------------------------------------------
+# filter_literal / in_filter
+# ---------------------------------------------------------------------------
+
+
+def test_filter_literal_doubles_single_quotes():
+    """The one place the Viya filter escaping rule is stated."""
+    assert filter_literal("O'Brien") == "O''Brien"
+    assert filter_literal("plain") == "plain"
+
+
+def test_filter_literal_treats_none_as_empty():
+    """Callers interpolate the result directly, so None must not become 'None'."""
+    assert filter_literal(None) == ""
+    assert filter_literal("") == ""
+
+
+def test_contains_filter_goes_through_filter_literal():
+    """The two builders must not drift apart on escaping."""
+    value = "O'Brien"
+    assert contains_filter(value) == "contains(name,'" + filter_literal(value) + "')"
+
+
+def test_in_filter_builds_a_set_membership_clause():
+    assert in_filter("id", ["a", "b", "c"]) == "in(id,'a','b','c')"
+    assert in_filter("id", ["only"]) == "in(id,'only')"
+
+
+def test_in_filter_escapes_every_value():
+    """One unescaped value would malform the whole clause, not just its own term."""
+    assert in_filter("name", ["a", "O'Brien"]) == "in(name,'a','O''Brien')"
 
 
 # ---------------------------------------------------------------------------
