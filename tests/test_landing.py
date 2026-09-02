@@ -196,13 +196,17 @@ def test_render_page_read_only_and_partial_tiers_are_called_out():
     page = render_page(_facts(read_only=True, enabled_tiers=frozenset({0, 1, 2, 3, 7})), nonce="n")
     assert "Read-only mode" in page
     assert "Read-only mode is on." in page
-    assert "Tiers 0–3, 7 of 0–8" in page
+    assert "Tiers 0–3, 7 of 0–9" in page
     assert "limited this deployment to tool tiers" in page
 
 
 def test_render_page_tier_0_implies_tier_8():
-    """MCP_TIERS=0-7 exposes every tool (Tier 8 is inside Tier 0) and must read as 'all'."""
-    facts = _facts(enabled_tiers=frozenset(range(8)))
+    """Every tier but 8 still reads as 'all' — Tier 8's only tool is inside Tier 0.
+
+    The selection deliberately omits 8 and nothing else, so this keeps testing
+    the implication rather than merely tracking however many tiers exist.
+    """
+    facts = _facts(enabled_tiers=frozenset(tools.ALL_TIERS) - {8})
     assert facts.all_tiers_enabled is True
     assert "All tool tiers" in render_page(facts, nonce="n")
     assert _facts(enabled_tiers=frozenset({3, 8})).all_tiers_enabled is False

@@ -39,7 +39,7 @@ server:
   # Advertised to MCP clients during the initialize handshake.
   name: SAS Viya Execution MCP Server
   port: 8134
-  # Tool tiers to expose, e.g. "0-4" or "0,1,7". Empty = all 75 tools.
+  # Tool tiers to expose, e.g. "0-4" or "0,1,7". Empty = all 87 tools.
   tiers: ""
   # Expose only tools that neither change server-side state nor cause
   # server-side work (43 of 75). Composes with `tiers`.

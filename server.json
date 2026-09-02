@@ -65,7 +65,7 @@
         },
         {
           "name": "MCP_TIERS",
-          "description": "Expose only some tool tiers, e.g. 0-4 or 0,1,7. Empty exposes all 75 tools. Tiers: 0 Compute, 1 Data Discovery, 2 Data Operations, 3 Reports, 4 Batch Jobs, 5 AutoML, 6 Models, 7 Decisioning.",
+          "description": "Expose only some tool tiers, e.g. 0-4 or 0,1,7. Empty exposes all 87 tools. Tiers: 0 Compute, 1 Data Discovery, 2 Data Operations, 3 Reports, 4 Batch Jobs, 5 AutoML, 6 Models, 7 Decisioning, 8 Workbench, 9 Business Glossary.",
           "format": "string"
         },
         {
