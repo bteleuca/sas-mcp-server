@@ -70,7 +70,7 @@ async def test_on_list_tools_injects_goal_first_and_required():
     )
     async with Client(mcp) as client:
         tools = await client.list_tools()
-        schema = tools[0].inputSchema
+        schema = tools[0].input_schema
         props = schema["properties"]
         assert list(props.keys())[0] == "goal"
         assert props["goal"] == GOAL_SCHEMA
@@ -87,7 +87,7 @@ async def test_on_list_tools_require_goal_false_omits_required():
         TelemetryMiddleware(FakeLogger(), require_goal=False, transport="stdio")
     )
     async with Client(mcp) as client:
-        schema = (await client.list_tools())[0].inputSchema
+        schema = (await client.list_tools())[0].input_schema
         assert "goal" in schema["properties"]
         assert "goal" not in schema.get("required", [])
 

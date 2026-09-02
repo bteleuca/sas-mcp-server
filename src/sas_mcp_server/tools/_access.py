@@ -28,9 +28,9 @@ the registered surface, so adding a tool without classifying it fails CI.
 
 **Advertised as well as enforced.** The same partition is published to clients
 as MCP *tool annotations* (spec revision 2025-03-26, "Tool annotations"):
-``readOnlyHint`` is derived from :data:`READ_ONLY_TOOLS` — one table, one
-truth — and the finer ``destructiveHint`` / ``idempotentHint`` /
-``openWorldHint`` come from the small sets below. Annotations are hints for the
+``read_only_hint`` is derived from :data:`READ_ONLY_TOOLS` — one table, one
+truth — and the finer ``destructive_hint`` / ``idempotent_hint`` /
+``open_world_hint`` come from the small sets below. Annotations are hints for the
 *client's* approval UX (group read-only tools, warn before destructive ones),
 not enforcement; ``MCP_READ_ONLY`` remains the enforcement, and the spec tells
 clients to treat hints as untrusted unless the server is trusted. Without them
@@ -224,30 +224,30 @@ OPEN_WORLD_TOOLS: frozenset[str] = frozenset(
 # stated explicitly rather than left implicit. test_read_only.py guarantees no
 # registered tool takes this path, so this is belt-and-braces, not a policy.
 _PESSIMISTIC = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True
 )
 
 
 def annotations_for(name: str) -> ToolAnnotations:
     """MCP tool annotations for *name*, derived from the classification above.
 
-    ``readOnlyHint`` mirrors :data:`READ_ONLY_TOOLS` exactly, so what a client
+    ``read_only_hint`` mirrors :data:`READ_ONLY_TOOLS` exactly, so what a client
     is told and what ``MCP_READ_ONLY`` enforces cannot drift apart. Unknown
     names get the pessimistic defaults (fail closed).
     """
     if name in READ_ONLY_TOOLS:
         return ToolAnnotations(
-            readOnlyHint=True,
-            destructiveHint=False,
-            idempotentHint=True,
-            openWorldHint=name in OPEN_WORLD_TOOLS,
+            read_only_hint=True,
+            destructive_hint=False,
+            idempotent_hint=True,
+            open_world_hint=name in OPEN_WORLD_TOOLS,
         )
     if name in WRITE_TOOLS:
         return ToolAnnotations(
-            readOnlyHint=False,
-            destructiveHint=name in DESTRUCTIVE_TOOLS,
-            idempotentHint=name in IDEMPOTENT_WRITE_TOOLS,
-            openWorldHint=name in OPEN_WORLD_TOOLS,
+            read_only_hint=False,
+            destructive_hint=name in DESTRUCTIVE_TOOLS,
+            idempotent_hint=name in IDEMPOTENT_WRITE_TOOLS,
+            open_world_hint=name in OPEN_WORLD_TOOLS,
         )
     return _PESSIMISTIC.model_copy()
 

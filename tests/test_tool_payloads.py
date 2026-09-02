@@ -117,7 +117,7 @@ async def test_tool_schemas(mcp_server_with_mock_client):
         tool_map = {t.name: t for t in tools}
 
         create_ml = tool_map["create_ml_project"]
-        props = create_ml.inputSchema["properties"]
+        props = create_ml.input_schema["properties"]
         assert "project_name" in props
         assert "caslib_name" in props
         assert "table_name" in props
@@ -126,40 +126,40 @@ async def test_tool_schemas(mcp_server_with_mock_client):
         assert "prediction_type" in props
         assert "target_event_level" in props
         assert "auto_run" in props
-        required = create_ml.inputSchema.get("required", [])
+        required = create_ml.input_schema.get("required", [])
         assert "project_name" in required
         assert "caslib_name" in required
         assert "table_name" in required
         assert "target_variable" in required
 
         score = tool_map["score_data"]
-        props = score.inputSchema["properties"]
+        props = score.input_schema["properties"]
         assert "module_id" in props
         assert "step_id" in props
         assert "input_data" in props
 
         submit = tool_map["submit_batch_job"]
-        props = submit.inputSchema["properties"]
+        props = submit.input_schema["properties"]
         assert "sas_code" in props
         assert "job_name" in props
 
         register_champion = tool_map["register_ml_champion_model"]
-        props = register_champion.inputSchema["properties"]
+        props = register_champion.input_schema["properties"]
         assert "project_id" in props
-        required = register_champion.inputSchema.get("required", [])
+        required = register_champion.input_schema.get("required", [])
         assert "project_id" in required
 
         list_publishing = tool_map["list_publishing_destinations"]
-        props = list_publishing.inputSchema["properties"]
+        props = list_publishing.input_schema["properties"]
         assert "limit" in props
         assert "start" in props
         assert "filter_name" in props
 
         publish_champion = tool_map["publish_ml_champion_model"]
-        props = publish_champion.inputSchema["properties"]
+        props = publish_champion.input_schema["properties"]
         assert "project_id" in props
         assert "destination_name" in props
-        required = publish_champion.inputSchema.get("required", [])
+        required = publish_champion.input_schema.get("required", [])
         assert "project_id" in required
         assert "destination_name" in required
 

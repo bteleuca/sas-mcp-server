@@ -446,3 +446,29 @@ def test_landing_middleware_is_installed_when_enabled():
     installed = any(m.cls is LandingPageMiddleware for m in mcp_server._http_middleware)
     assert installed is mcp_server.MCP_LANDING_PAGE
     assert mcp_server.MCP_PATH.startswith("/")
+
+
+def test_annotation_hint_field_names_exist_on_the_model():
+    """The two hint field names must be real fields on ``ToolAnnotations``.
+
+    ``_hint`` reads them with ``getattr(..., None)``, which cannot distinguish
+    "this tool declares nothing" from "this field was renamed". Without this
+    assertion an SDK rename would blank every read-only and destructive badge on
+    the page and every other test would still pass. MCP SDK v2 already renamed
+    these once, from camelCase.
+    """
+    from mcp.types import ToolAnnotations
+
+    fields = set(ToolAnnotations.model_fields)
+    assert landing._READ_ONLY_HINT in fields
+    assert landing._DESTRUCTIVE_HINT in fields
+
+
+def test_hint_reads_declared_values_and_tolerates_no_annotations():
+    from mcp.types import ToolAnnotations
+
+    ann = ToolAnnotations(read_only_hint=True, destructive_hint=False)
+    assert landing._hint(ann, landing._READ_ONLY_HINT) is True
+    assert landing._hint(ann, landing._DESTRUCTIVE_HINT) is False
+    assert landing._hint(None, landing._READ_ONLY_HINT) is None
+    assert landing._hint(ToolAnnotations(), landing._READ_ONLY_HINT) is None
