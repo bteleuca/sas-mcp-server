@@ -42,7 +42,7 @@ server:
   # Tool tiers to expose, e.g. "0-4" or "0,1,7". Empty = all 87 tools.
   tiers: ""
   # Expose only tools that neither change server-side state nor cause
-  # server-side work (43 of 75). Composes with `tiers`.
+  # server-side work (50 of 87). Composes with `tiers`.
   readOnly: false
   # Serve an explanatory HTML page (deployment summary, exposed tiers, client
   # config snippets) to a browser that opens the /mcp URL, instead of the bare

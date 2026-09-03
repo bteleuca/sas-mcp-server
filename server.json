@@ -70,7 +70,7 @@
         },
         {
           "name": "MCP_READ_ONLY",
-          "description": "Expose only tools that neither change server-side state nor cause server-side work (43 of 75). Composes with MCP_TIERS.",
+          "description": "Expose only tools that neither change server-side state nor cause server-side work (50 of 87). Composes with MCP_TIERS.",
           "format": "string",
           "default": "false"
         }
