@@ -49,6 +49,11 @@ TERM_TYPE = {
          "required": True, "items": ["Local", "Group"]},
         {"name": "attr-risk", "label": "Used in Risk", "type": "boolean",
          "defaultValue": "false"},
+        {"name": "attr-region", "label": "Regions", "type": "multi-select",
+         "items": ["EMEA", "APAC", "AMER"]},
+        {"name": "attr-asof", "label": "As of", "type": "date"},
+        {"name": "attr-seen", "label": "Last seen", "type": "date-time"},
+        {"name": "attr-cutoff", "label": "Cutoff", "type": "time"},
         {"name": "attr-oper", "label": "Operational field", "type": "single-line"},
         {"name": "attr-note", "label": "Notes", "type": "multi-line"},
     ],
@@ -75,7 +80,15 @@ TERM = {
     "modifiedTimeStamp": "2026-06-11T12:02:35.602Z",
     # Keyed by attribute-definition UUID, and carrying the empty values the
     # glossary stores for every declared attribute.
-    "attributes": {"attr-scope": "Group", "attr-risk": "true", "attr-oper": "", "attr-note": ""},
+    # Viya stores a boolean as a JSON boolean, and a multi-select as one
+    # comma-joined string — both verified live against a real term type.
+    "attributes": {
+        "attr-scope": "Group",
+        "attr-risk": True,
+        "attr-region": "EMEA,APAC",
+        "attr-oper": "",
+        "attr-note": "",
+    },
     "links": [{"rel": "self", "href": f"/glossary/terms/{TERM_ID}"}],
 }
 
@@ -119,7 +132,21 @@ RELATIONSHIP = {
     "endpoint2Id": COLUMN_CURR["id"],
 }
 
-_ENTITIES = {e["id"]: e for e in (TERM_ENTITY, TABLE_ENTITY, COLUMN_CURR, COLUMN_BAL)}
+# A table the catalog knows about but whose columns it never indexed — the
+# shape that makes every column name look wrong.
+EMPTY_TABLE_RESOURCE = "/dataTables/dataSources/Compute~fs~abc~fs~PUBLIC/tables/NOT_INDEXED"
+EMPTY_TABLE = {
+    "id": "cent-empty-table",
+    "name": "NOT_INDEXED",
+    "type": "sasTable",
+    "resourceId": EMPTY_TABLE_RESOURCE,
+    "attributes": {},
+}
+
+_ENTITIES = {
+    e["id"]: e
+    for e in (TERM_ENTITY, TABLE_ENTITY, COLUMN_CURR, COLUMN_BAL, EMPTY_TABLE)
+}
 
 
 class FakeViya:
@@ -300,7 +327,12 @@ def test_glossary_id_is_read_from_the_resource_id():
 def test_readable_attributes_names_keys_and_drops_empties():
     by_uuid, _ = gh.attribute_maps(TERM_TYPE)
     readable = gh.readable_attributes(TERM["attributes"], by_uuid)
-    assert readable == {"Scope": "Group", "Used in Risk": "true"}
+    assert readable == {
+        "Scope": "Group",
+        "Used in Risk": True,
+        # Stored comma-joined; handed back as the list the caller passed in.
+        "Regions": ["EMEA", "APAC"],
+    }
 
 
 def test_readable_attributes_keeps_unknown_uuids():
@@ -312,11 +344,14 @@ def test_readable_attributes_keeps_unknown_uuids():
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [(True, "true"), (False, "false"), ("true", "true"), ("FALSE", "false")],
+    [(True, True), (False, False), ("true", True), ("FALSE", False)],
 )
-def test_boolean_attributes_are_encoded_as_strings(value, expected):
+def test_boolean_attributes_are_encoded_as_json_booleans(value, expected):
+    """Viya rejects the string "true": the value has to stay a real bool."""
     definition = {"label": "Used in Risk", "type": "boolean"}
-    assert gh.encode_attribute(value, definition) == expected
+    encoded = gh.encode_attribute(value, definition)
+    assert encoded is expected
+    assert isinstance(encoded, bool)
 
 
 def test_boolean_attribute_rejects_a_non_boolean():
@@ -330,12 +365,98 @@ def test_single_select_rejects_a_value_outside_the_allowed_list():
         gh.encode_attribute("Regional", definition)
 
 
+
+# --- attribute wire formats ---------------------------------------------------
+# Each format below was established against a live glossary; the API publishes no
+# schema, and every one of these types rejects all but one spelling.
+
+
+def test_multi_select_joins_a_list_the_way_viya_stores_it():
+    """A JSON array and "a, b" are both rejected; only "a,b" is accepted."""
+    definition = {"label": "Regions", "type": "multi-select", "items": ["EMEA", "APAC"]}
+    assert gh.encode_attribute(["EMEA", "APAC"], definition) == "EMEA,APAC"
+
+
+def test_multi_select_accepts_the_stored_string_and_strips_spaces():
+    definition = {"label": "Regions", "type": "multi-select", "items": ["EMEA", "APAC"]}
+    assert gh.encode_attribute("EMEA, APAC", definition) == "EMEA,APAC"
+
+
+def test_multi_select_names_the_items_that_are_not_allowed():
+    """Viya's own rejection names the attribute but never which item was wrong."""
+    definition = {"label": "Regions", "type": "multi-select", "items": ["EMEA", "APAC"]}
+    with pytest.raises(ValueError) as excinfo:
+        gh.encode_attribute(["EMEA", "ANTARCTICA"], definition)
+    assert "ANTARCTICA" in str(excinfo.value)
+
+
+def test_multi_select_round_trips_through_decode():
+    definition = {"label": "Regions", "type": "multi-select", "items": ["EMEA", "APAC"]}
+    stored = gh.encode_attribute(["EMEA", "APAC"], definition)
+    assert gh.decode_attribute(stored, definition) == ["EMEA", "APAC"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-09-04T13:41:24Z", "2026-09-04T13:41:24Z"),
+        ("2026-09-04T13:41:24", "2026-09-04T13:41:24Z"),  # Z is mandatory
+        ("2026-09-04T13:41", "2026-09-04T13:41:00Z"),  # seconds are mandatory
+        ("2026-09-04", "2026-09-04T00:00:00Z"),  # a bare date is rejected as-is
+        ("2026-09-04T15:41:24+02:00", "2026-09-04T13:41:24Z"),  # offsets are rejected
+        ("2026-09-04T11:41:24-02:00", "2026-09-04T13:41:24Z"),
+    ],
+)
+def test_date_time_is_normalised_to_utc(value, expected):
+    assert gh.encode_attribute(value, {"label": "Last seen", "type": "date-time"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("15:41:28Z", "15:41:28Z"), ("15:41:28", "15:41:28Z"), ("15:41", "15:41:00Z")],
+)
+def test_time_gets_its_seconds_and_z(value, expected):
+    assert gh.encode_attribute(value, {"label": "Cutoff", "type": "time"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("2026-09-04", "2026-09-04"), ("2026-09-04T13:41:24Z", "2026-09-04")],
+)
+def test_date_keeps_only_the_date(value, expected):
+    assert gh.encode_attribute(value, {"label": "As of", "type": "date"}) == expected
+
+
+@pytest.mark.parametrize(
+    ("attr_type", "value"),
+    [("date", "31/12/2026"), ("time", "9am"), ("date-time", "next tuesday")],
+)
+def test_unparseable_dates_are_rejected_with_the_format_named(attr_type, value):
+    """Viya answers these with a bare 400; the caller needs the format instead."""
+    with pytest.raises(ValueError) as excinfo:
+        gh.encode_attribute(value, {"label": "X", "type": attr_type})
+    assert attr_type in str(excinfo.value)
+
+
+def test_a_required_attribute_set_to_empty_counts_as_missing():
+    """Viya rejects "" for a required attribute, so presence alone is not enough."""
+    _, by_label = gh.attribute_maps(TERM_TYPE)
+    with pytest.raises(ValueError, match="requires attribute"):
+        gh.encode_attributes({"Scope": ""}, by_label, require_all=True)
+
+
+def test_missing_required_finds_the_gap_in_a_merged_term():
+    _, by_label = gh.attribute_maps(TERM_TYPE)
+    assert gh.missing_required({"attr-scope": "Group"}, by_label) == []
+    assert gh.missing_required({"attr-scope": ""}, by_label) == ["Scope"]
+    assert gh.missing_required({}, by_label) == ["Scope"]
+
 def test_encode_attributes_maps_labels_case_insensitively():
     _, by_label = gh.attribute_maps(TERM_TYPE)
     encoded = gh.encode_attributes(
         {"scope": "Local", "USED IN RISK": True}, by_label, require_all=False
     )
-    assert encoded == {"attr-scope": "Local", "attr-risk": "true"}
+    assert encoded == {"attr-scope": "Local", "attr-risk": True}
 
 
 def test_encode_attributes_names_the_valid_labels_for_an_unknown_one():
@@ -464,7 +585,11 @@ async def test_get_glossary_term_names_its_attributes():
     fake = FakeViya()
     async with glossary_client(fake) as client:
         result = result_of(await client.call_tool("get_glossary_term", {"term_id": TERM_ID}))
-    assert result["attributes"] == {"Scope": "Group", "Used in Risk": "true"}
+    assert result["attributes"] == {
+        "Scope": "Group",
+        "Used in Risk": True,
+        "Regions": ["EMEA", "APAC"],
+    }
     assert result["attribute_ids"] == TERM["attributes"]  # raw map preserved
     assert result["term_id"] == TERM_ID
     assert result["catalog_entity_id"] == TERM_ENTITY_ID
@@ -520,6 +645,69 @@ async def test_a_single_filter_is_not_wrapped_in_and():
     listing = [r for r in fake.requests if r.url.path == "/glossary/terms"][0]
     assert listing.url.params["filter"] == "eq(parentId,'p-1')"
 
+
+
+async def test_term_type_publishes_the_wire_format_per_attribute():
+    """The formats are undocumented upstream, so the contract has to carry them."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool("get_glossary_term_type", {"term_type_id": TERM_TYPE_ID})
+        )
+    formats = {a["label"]: a["value_format"] for a in result["attributes"]}
+    assert "true/false" in formats["Used in Risk"]
+    assert "list" in formats["Regions"]
+    assert formats["As of"] == "yyyy-mm-dd"
+    assert "Z" in formats["Cutoff"]
+
+
+async def test_create_sends_a_real_boolean_not_the_string():
+    """The bug this guards: Viya rejects "true" and stores only its own default."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "create_glossary_term",
+            {
+                "name": "Exposure",
+                "term_type": "BCBS239",
+                "attributes": {"Scope": "Group", "Used in Risk": True},
+            },
+        )
+    body = next(p for p in fake.posted if p["path"] == "/glossary/terms")["body"]
+    assert body["attributes"]["attr-risk"] is True
+    # And it must survive serialisation as a JSON boolean, not "True".
+    assert '"attr-risk": true' in json.dumps(body)
+
+
+async def test_create_sends_multi_select_as_a_joined_string():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "create_glossary_term",
+            {
+                "name": "Exposure",
+                "term_type": "BCBS239",
+                "attributes": {"Scope": "Group", "Regions": ["EMEA", "APAC"]},
+            },
+        )
+    body = next(p for p in fake.posted if p["path"] == "/glossary/terms")["body"]
+    assert body["attributes"]["attr-region"] == "EMEA,APAC"
+
+
+async def test_update_refuses_when_a_required_attribute_became_required_later():
+    """The whole term is rewritten, so an unrelated edit fails on a field the
+    caller never mentioned. Say which one, before calling Viya."""
+    fake = FakeViya()
+    stale = {**TERM, "attributes": {**TERM["attributes"], "attr-scope": ""}}
+    fake.overrides[f"GET /glossary/terms/{TERM_ID}"] = stale
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "update_glossary_term", {"term_id": TERM_ID, "attributes": {"Notes": "x"}}
+            )
+    message = str(excinfo.value)
+    assert "Scope" in message and "required" in message
+    assert not fake.put_bodies, "must not reach Viya"
 
 # --- term <-> asset linkage ---------------------------------------------------
 
@@ -744,7 +932,7 @@ async def test_create_translates_labels_to_attribute_uuids():
             },
         )
     body = next(p for p in fake.posted if p["path"] == "/glossary/terms")["body"]
-    assert body["attributes"] == {"attr-scope": "Group", "attr-risk": "true"}
+    assert body["attributes"] == {"attr-scope": "Group", "attr-risk": True}
     assert body["termTypeId"] == TERM_TYPE_ID
     assert body["definition"] == "Amount at risk."
     assert "parentId" not in body  # omitted rather than sent as null
@@ -806,9 +994,11 @@ async def test_update_can_clear_one_attribute():
     fake = FakeViya()
     async with glossary_client(fake) as client:
         await client.call_tool(
-            "update_glossary_term", {"term_id": TERM_ID, "attributes": {"Scope": ""}}
+            "update_glossary_term", {"term_id": TERM_ID, "attributes": {"Notes": ""}}
         )
-    assert fake.put_bodies[0]["attributes"]["attr-scope"] == ""
+    assert fake.put_bodies[0]["attributes"]["attr-note"] == ""
+    # The others survive the whole-resource PUT.
+    assert fake.put_bodies[0]["attributes"]["attr-scope"] == "Group"
 
 
 async def test_delete_calls_the_glossary_not_the_catalog():
@@ -915,3 +1105,21 @@ async def test_a_term_reference_is_required():
     async with glossary_client(fake) as client:
         with pytest.raises(Exception, match="provide term_id or term_name"):
             await client.call_tool("list_term_assets", {})
+
+
+async def test_assign_reports_an_indexing_gap_rather_than_a_bad_column_name():
+    """A table indexed without its columns rejects every column name; say why."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "assign_glossary_term",
+                {
+                    "term_id": TERM_ID,
+                    "resource_uri": EMPTY_TABLE_RESOURCE,
+                    "column_name": "ANY_COLUMN",
+                },
+            )
+    message = str(excinfo.value)
+    assert "indexing gap" in message
+    assert "catalog_run_agent" in message

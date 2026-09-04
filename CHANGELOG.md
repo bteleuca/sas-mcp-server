@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Boolean attributes could never be set on a glossary term.** Every attribute value was coerced to a string, so a boolean travelled as `"true"` and Viya rejected it — `The value "true" for the field "<label>" is invalid` — on both create and update. Only the term type's own default was ever stored, which made any term type carrying a boolean unusable through MCP. Booleans now travel as JSON booleans, verified end to end against a live glossary. Reported from a session that built out a real glossary; the same report is the source of everything below.
+- **Multi-select attributes could not take a list.** A Python list was sent as its `str()` (`"['1', 'test']"`) and rejected. Viya stores a multi-select as its selected items joined with `,` and no spaces — it rejects a JSON array, `"a, b"` and `"a;b"` alike — so the join now happens in the tool: pass `["EMEA", "APAC"]`, get `EMEA,APAC` on the wire, and a list back from `get_glossary_term`. Each item is checked against the type's allowed values first, because Viya's own rejection names the attribute but never which item was wrong.
+- **Date, date-time and time values were forwarded unchecked** and came back as bare HTTP 400s. Viya accepts exactly one spelling of each — `yyyy-mm-dd`, `yyyy-mm-ddThh:mm:ssZ`, `hh:mm:ssZ` — with the `Z` and the seconds mandatory and numeric offsets rejected outright. The recoverable cases are now normalised rather than forwarded (a bare date becomes midnight UTC, a missing `Z` or missing seconds are supplied, and a `+02:00` offset is converted to the same instant in UTC); the rest are rejected by name, with the expected format quoted.
+- **An attribute made required after a term existed broke every later update of that term.** An update is a whole-resource PUT, so it replays attributes the caller never mentioned; if one of those had since become required and was empty, Viya rejected the write naming *that* attribute — while the caller was editing something else. The merged term is now checked first and the failure explains which attribute and why. Relatedly, a required attribute supplied as `""` is treated as missing on create, since that is exactly what the glossary stores for an unset one.
+- **Viya errors arrived behind two lines of HTTP boilerplate.** Every failure led with httpx's status phrase, the full URL and a link to the MDN page for the status code, ahead of the one line that says what was actually wrong. Errors now read `HTTP 400 from POST /glossary/terms — Viya reported: ...`. Affects every tier, not just the glossary.
+- **Assigning a term to a table the catalog indexed *without* its columns reported a wrong column name.** With no columns indexed, every name looks wrong and the error listed an empty set of alternatives. It now names the indexing gap and points at `catalog_run_agent`.
+
+### Added
+- **`get_glossary_term_type` now reports a `value_format` per attribute.** The glossary service publishes no OpenAPI document and several attribute types accept exactly one spelling, so the contract a caller needs was previously discoverable only by provoking a 400. Each attribute now states its accepted form alongside its type, required flag and allowed values.
+
+
 ## [1.13.0] - 2026-09-04
 
 ### Added

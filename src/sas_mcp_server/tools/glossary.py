@@ -42,10 +42,12 @@ from pydantic import BeforeValidator
 
 from ..config import VIYA_ENDPOINT
 from ..helpers.glossary_helpers import (
+    WIRE_FORMATS,
     attribute_maps,
     chunk_ids,
     encode_attributes,
     glossary_id_from_resource,
+    missing_required,
     readable_attributes,
 )
 from ..viya_client import (
@@ -334,6 +336,17 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             if (column.get("name") or "").strip().lower() == wanted:
                 return column
         available = sorted((column.get("name") or "") for column in columns)
+        if not columns:
+            # The table is indexed but its columns are not, which reads as
+            # "no such column" for every column and is nothing the caller did
+            # wrong. Existing assignments on this table stay visible, so it
+            # looks even less like a discovery gap than it is.
+            raise ValueError(
+                f"the catalog holds table '{table.get('name')}' but none of its columns, so "
+                "there is nothing to attach a term to. This is an indexing gap, not a wrong "
+                "column name: run catalog_run_agent to discover the table's columns, then "
+                f"retry. Table URI: {table.get('resourceId', '')}"
+            )
         raise ValueError(
             f"table '{table.get('name')}' has no column '{column_name}'. Columns: {available}"
         )
@@ -385,10 +398,11 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         """Get a term type and the attribute contract its terms must satisfy.
 
         Call this **before** creating or updating a term: it names every custom
-        attribute, its data type, whether it is required, and — for a
-        single-select — the exact values accepted. ``create_glossary_term`` takes
-        attributes keyed by the ``label`` shown here, so this is also the
-        vocabulary to write in.
+        attribute, its data type, whether it is required, the exact values a
+        single- or multi-select accepts, and ``value_format`` — the one spelling
+        Viya takes for that type, which the API itself documents nowhere.
+        ``create_glossary_term`` takes attributes keyed by the ``label`` shown
+        here, so this is also the vocabulary to write in.
 
         Args:
             term_type_id: The term type UUID, or its name — list_glossary_term_types
@@ -407,6 +421,12 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                     "allowed_values": definition.get("items", []),
                     "default": definition.get("defaultValue", ""),
                     "attribute_id": definition.get("name"),
+                    # The glossary publishes no schema, and several of these
+                    # types accept exactly one spelling. Saying which, here,
+                    # is what stops the write being shaped by trial and error.
+                    "value_format": WIRE_FORMATS.get(
+                        (definition.get("type") or "").lower(), "a string"
+                    ),
                 }
                 for definition in term_type.get("attributes", []) or []
             ]
@@ -785,9 +805,20 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
 
         ``attributes`` is keyed by the attribute **labels** from
         ``get_glossary_term_type`` — call that first, because a term type can
-        make attributes mandatory and a term missing one is rejected. Values are
-        validated here (booleans, single-select options), so a mistake comes back
-        naming the attribute instead of as an opaque HTTP 400.
+        make attributes mandatory and a term missing one is rejected. Pass each
+        value in its natural Python form and it is converted to the one spelling
+        the glossary accepts:
+
+        * **boolean** — ``True`` / ``False`` (the *strings* ``"true"``/``"false"``
+          are rejected by Viya; that conversion happens here)
+        * **multi-select** — a list, e.g. ``["Retail", "Wholesale"]``
+        * **date** — ``"2026-09-04"``
+        * **date-time** — ``"2026-09-04T13:41:24Z"``; a bare date or a numeric
+          offset is normalised to UTC rather than rejected
+        * **time** — ``"15:41:28Z"``; seconds and the ``Z`` are required
+
+        Values are validated before the call, so a mistake comes back naming the
+        attribute and what it expected, instead of as an opaque HTTP 400.
 
         **Terms are published by default.** The underlying API defaults to
         creating a *draft*, which nobody but its author can see; that is almost
@@ -805,7 +836,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             label: Display name, if it should differ from ``name``.
             parent_id: Parent term id, to nest this term in the hierarchy.
             attributes: Custom attributes keyed by label, e.g.
-                ``{"Scope": "Group", "Used in Risk": true}``.
+                ``{"Scope": "Group", "Used in Risk": True,
+                "Regions": ["EMEA", "APAC"]}``.
             publish: Publish immediately (default true). False leaves a draft.
         """
         async with viya_session("create_glossary_term", ctx) as client:
@@ -865,6 +897,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         the same way, per attribute — pass only the ones you are changing, and
         set one to ``""`` to clear it.
 
+        Because the whole term is rewritten, every attribute the type marks
+        **required** must hold a value — including ones made required after this
+        term was created. That is checked before the call, and reported by name.
+
         A term's type cannot be changed after creation, nor can a published
         term's parent.
 
@@ -874,7 +910,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             definition: New definition.
             description: New description, max 1000 characters.
             label: New display label.
-            attributes: Custom attributes to change, keyed by label.
+            attributes: Custom attributes to change, keyed by label. Same value
+                forms as create_glossary_term — booleans as True/False,
+                multi-select as a list.
         """
         async with viya_session("update_glossary_term", ctx) as client:
             current = await get_json(f"{_GLOSSARY}/terms/{term_id}", client, accept=_TERM_MEDIA)
@@ -883,6 +921,18 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
 
             merged = dict(current.get("attributes") or {})
             merged.update(encode_attributes(attributes, by_label, require_all=False))
+            # An update is a whole-resource PUT, so it replays attributes the
+            # caller never mentioned. If one of those was made required after
+            # this term was written, Viya rejects the edit and names *that*
+            # attribute — baffling when you were changing something else.
+            unmet = missing_required(merged, by_label)
+            if unmet:
+                raise ValueError(
+                    f"this term is missing required attribute(s) {unmet}, so it cannot be "
+                    "saved. They were most likely made required after the term was created: "
+                    "an update rewrites the whole term, so every required attribute must "
+                    "hold a value. Supply them in this same call."
+                )
 
             body = {key: value for key, value in current.items() if key != "links"}
             if name is not None:
