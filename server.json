@@ -65,12 +65,12 @@
         },
         {
           "name": "MCP_TIERS",
-          "description": "Expose only some tool tiers, e.g. 0-4 or 0,1,7. Empty exposes all 90 tools. Tiers: 0 Compute, 1 Data Discovery, 2 Data Operations, 3 Reports, 4 Batch Jobs, 5 AutoML, 6 Models, 7 Decisioning, 8 Workbench, 9 Business Glossary.",
+          "description": "Expose only some tool tiers, e.g. 0-4 or 0,1,7. Empty exposes all 91 tools. Tiers: 0 Compute, 1 Data Discovery, 2 Data Operations, 3 Reports, 4 Batch Jobs, 5 AutoML, 6 Models, 7 Decisioning, 8 Workbench, 9 Business Glossary.",
           "format": "string"
         },
         {
           "name": "MCP_READ_ONLY",
-          "description": "Expose only tools that neither change server-side state nor cause server-side work (50 of 90). Composes with MCP_TIERS.",
+          "description": "Expose only tools that neither change server-side state nor cause server-side work (50 of 91). Composes with MCP_TIERS.",
           "format": "string",
           "default": "false"
         }

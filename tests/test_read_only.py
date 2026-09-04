@@ -85,7 +85,7 @@ async def test_named_read_tools_survive(tool_name):
 
 
 async def test_default_is_unfiltered():
-    assert len(await _register()) == 90
+    assert len(await _register()) == 91
 
 
 # --- composition with tier selection ------------------------------------------
@@ -117,12 +117,12 @@ async def test_env_var_drives_default(monkeypatch):
     monkeypatch.setattr(tools, "MCP_READ_ONLY", True)
     assert await _register() == set(READ_ONLY_TOOLS)
     monkeypatch.setattr(tools, "MCP_READ_ONLY", False)
-    assert len(await _register()) == 90
+    assert len(await _register()) == 91
 
 
 async def test_explicit_argument_overrides_env_var(monkeypatch):
     monkeypatch.setattr(tools, "MCP_READ_ONLY", True)
-    assert len(await _register(read_only=False)) == 90
+    assert len(await _register(read_only=False)) == 91
     monkeypatch.setattr(tools, "MCP_READ_ONLY", False)
     assert await _register(read_only=True) == set(READ_ONLY_TOOLS)
 

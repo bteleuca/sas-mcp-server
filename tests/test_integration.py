@@ -1617,6 +1617,7 @@ TOOL_COVERAGE = {
     "create_glossary_term_type": "test_glossary_term_type_lifecycle",
     "update_glossary_term_type": "test_glossary_term_type_lifecycle",
     "delete_glossary_term_type": "test_glossary_term_type_lifecycle",
+    "import_glossary_terms": "test_glossary_bulk_import",
 }
 
 
@@ -2229,3 +2230,107 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                     )
                 ).data
                 assert gone["status"] == "deleted"
+
+
+async def test_glossary_bulk_import(integration_mcp_server):
+    """Import a three-level hierarchy in one call, then take it back down.
+
+    The point is that no id is threaded: children name their parent, and the
+    rows may be given in any order. The import runs as a job that reports
+    ``completed`` even when rows fail, so the created/failed tallies matter more
+    than the call not raising.
+    """
+    type_name = f"MCP_TEST_IMPORT_TYPE_{_SUFFIX}"
+    prefix = f"MCP_IMP_{_SUFFIX}"
+    type_id = None
+    created_ids: list[str] = []
+    async with Client(integration_mcp_server) as client:
+        try:
+            type_id = (
+                await client.call_tool(
+                    "create_glossary_term_type",
+                    {
+                        "name": type_name,
+                        "attributes": [
+                            {"label": "Tier", "type": "single-select",
+                             "allowed_values": ["Gold", "Silver"]},
+                            {"label": "Masked", "type": "boolean"},
+                        ],
+                    },
+                )
+            ).data["term_type_id"]
+
+            # Deliberately out of order: the leaf comes before its ancestors.
+            result = (
+                await client.call_tool(
+                    "import_glossary_terms",
+                    {
+                        "term_type": type_id,
+                        "terms": [
+                            {"name": f"{prefix} Leaf", "parent": f"{prefix} Mid",
+                             "attributes": {"Tier": "Silver", "Masked": False}},
+                            {"name": f"{prefix} Root", "definition": "imported root",
+                             "attributes": {"Tier": "Gold", "Masked": True}},
+                            {"name": f"{prefix} Mid", "parent": f"{prefix} Root"},
+                        ],
+                    },
+                )
+            ).data
+            assert result["failures"] == [], f"import reported failures: {result['failures']}"
+            assert result["created"] == 3
+            assert result["order"] == [
+                f"{prefix} Root", f"{prefix} Mid", f"{prefix} Leaf"
+            ], "parents must be emitted before their children"
+
+            # The hierarchy is real: each child hangs off the right parent.
+            listed = (
+                await client.call_tool(
+                    "list_glossary_terms",
+                    {"term_type": type_id, "limit": 20, "include_attributes": True},
+                )
+            ).data
+            by_name = {i["name"]: i for i in listed["items"]}
+            created_ids = [i["term_id"] for i in listed["items"]]
+            assert set(by_name) == {f"{prefix} Root", f"{prefix} Mid", f"{prefix} Leaf"}
+            assert by_name[f"{prefix} Root"]["parent_id"] is None
+            assert by_name[f"{prefix} Mid"]["parent_id"] == by_name[f"{prefix} Root"]["term_id"]
+            assert by_name[f"{prefix} Leaf"]["parent_id"] == by_name[f"{prefix} Mid"]["term_id"]
+
+            # Attribute values survive the CSV round trip in their own types.
+            assert by_name[f"{prefix} Root"]["attributes"]["Masked"] is True
+            assert by_name[f"{prefix} Leaf"]["attributes"]["Tier"] == "Silver"
+
+            # A bad value is caught here, before anything is sent.
+            with pytest.raises(Exception, match="only accepts"):
+                await client.call_tool(
+                    "import_glossary_terms",
+                    {
+                        "term_type": type_id,
+                        "terms": [{"name": f"{prefix} Bad", "attributes": {"Tier": "Bronze"}}],
+                    },
+                )
+        finally:
+            # Deepest first: a parent cannot be deleted while a child points at it.
+            async def depth(term_id: str) -> int:
+                steps = 0
+                current = (
+                    await client.call_tool("get_glossary_term", {"term_id": term_id})
+                ).data
+                while current.get("parent_id"):
+                    steps += 1
+                    current = (
+                        await client.call_tool(
+                            "get_glossary_term", {"term_id": current["parent_id"]}
+                        )
+                    ).data
+                return steps
+
+            ranked = sorted(
+                [(await depth(tid), tid) for tid in created_ids], reverse=True
+            )
+            for _, tid in ranked:
+                await client.call_tool("delete_glossary_term", {"term_id": tid})
+            if type_id:
+                await client.call_tool(
+                    "delete_glossary_term_type", {"term_type_id": type_id, "force": True}
+                )

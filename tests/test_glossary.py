@@ -163,6 +163,8 @@ class FakeViya:
         self.posted: list[dict[str, Any]] = []
         self.put_bodies: list[dict[str, Any]] = []
         self.relationships: list[dict[str, Any]] = [RELATIONSHIP]
+        self.import_counts: dict[str, int] = {"successful": 0, "errors": 0, "warnings": 0}
+        self.import_log = "The term import process has completed.\n"
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
@@ -235,6 +237,20 @@ class FakeViya:
             return self._json({"items": [TERM], "count": 1})
         if method == "GET" and path.startswith("/glossary/terms/"):
             return self._json(TERM)
+        if method == "POST" and path == "/glossary/importTerms":
+            self.posted.append({"path": path, "body": request.content, "params": {}})
+            return self._json({"id": "job-1", "state": "running"}, 202)
+        if method == "GET" and path.startswith("/jobExecution/jobs/"):
+            return self._json(
+                {
+                    "id": "job-1",
+                    "state": "completed",
+                    "results": {"counts": json.dumps(self.import_counts)},
+                    "logLocation": "/files/files/log-1",
+                }
+            )
+        if method == "GET" and path == "/files/files/log-1/content":
+            return httpx.Response(200, text=self.import_log)
         if method == "POST" and path == "/glossary/termTypes":
             body = json.loads(request.content)
             self.posted.append({"path": path, "body": body, "params": dict(request.url.params)})
@@ -1384,3 +1400,190 @@ async def test_search_can_attach_attributes_and_batches_the_lookup():
         if r.url.path == "/glossary/terms" and "in(id," in r.url.params.get("filter", "")
     ]
     assert len(batched) == 1, "one batched lookup, not one call per hit"
+
+
+# --- bulk import ---------------------------------------------------------------
+
+
+def test_import_orders_parents_before_children_and_builds_paths():
+    """The import resolves a parent by path against rows already processed."""
+    ordered = gh.resolve_import_paths(
+        [
+            {"name": "Leaf", "parent": "Mid"},
+            {"name": "Root"},
+            {"name": "Mid", "parent": "Root"},
+        ]
+    )
+    assert [r["name"] for r in ordered] == ["Root", "Mid", "Leaf"]
+    assert [r["_path"] for r in ordered] == ["", "Root", "Root\Mid"]
+
+
+def test_import_takes_an_unknown_parent_as_an_existing_path():
+    ordered = gh.resolve_import_paths([{"name": "Child", "parent": "Existing\Branch"}])
+    assert ordered[0]["_path"] == "Existing\Branch"
+
+
+def test_a_circular_parent_chain_is_refused():
+    with pytest.raises(ValueError, match="circular"):
+        gh.resolve_import_paths(
+            [{"name": "A", "parent": "B"}, {"name": "B", "parent": "A"}]
+        )
+
+
+def test_a_duplicate_name_in_one_batch_is_refused():
+    with pytest.raises(ValueError, match="twice"):
+        gh.resolve_import_paths([{"name": "A"}, {"name": "a"}])
+
+
+def test_a_backslash_in_a_name_is_refused():
+    """It separates path levels, so a name carrying one builds the wrong tree."""
+    with pytest.raises(ValueError, match="backslash"):
+        gh.resolve_import_paths([{"name": "Risk\Credit"}])
+
+
+def test_csv_quotes_a_multi_select_value():
+    ordered = gh.resolve_import_paths([{"name": "A", "term_type": "T"}])
+    ordered[0]["attributes"] = {"Regions": "EMEA,APAC"}
+    csv = gh.build_term_csv(ordered, ["Regions"])
+    assert csv.startswith("Name,Type,Path,Description,Regions\r\n")
+    assert '"EMEA,APAC"' in csv, "the comma must not split the column"
+
+
+def test_import_log_is_parsed_into_rows():
+    log = (
+        "The term import process has completed.\n"
+        'Import failed for term (Bad) on row 2. Error: The value "X" for the field "Scope" '
+        "is invalid.\n"
+        'Import failed for term (Root\Mid) on row 3. Error: A parent term with the path '
+        '"Root" does not exist.\n'
+    )
+    failures = gh.parse_import_log(log)
+    assert [f["row"] for f in failures] == [2, 3]
+    assert failures[0]["term"] == "Bad"
+    assert "Scope" in failures[0]["error"]
+
+
+async def test_import_sends_a_csv_and_reports_what_was_created():
+    fake = FakeViya()
+    fake.import_counts = {"successful": 2, "errors": 0, "warnings": 0}
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [
+                        {"name": "Child", "parent": "Parent", "definition": "a child"},
+                        {"name": "Parent", "attributes": {"Used in Risk": True}},
+                    ],
+                },
+            )
+        )
+    assert result["created"] == 2
+    assert result["failed"] == 0
+    assert result["order"] == ["Parent", "Child"], "parents must be emitted first"
+    sent = next(p for p in fake.posted if p["path"] == "/glossary/importTerms")["body"]
+    text = sent.decode("utf-8", "replace")
+    assert "Name,Type,Path,Description,Used in Risk" in text
+    assert "Parent,BCBS239,,,true" in text
+    assert "Child,BCBS239,Parent,a child," in text
+
+
+async def test_import_reports_per_row_failures_from_the_log():
+    """The job says 'completed' even when rows failed, so this must not read as success."""
+    fake = FakeViya()
+    fake.import_counts = {"successful": 1, "errors": 1, "warnings": 0}
+    fake.import_log = (
+        "The term import process has completed.\n"
+        'Import failed for term (Child) on row 3. Error: A parent term with the path '
+        '"Parent" does not exist.\n'
+    )
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {"term_type": "BCBS239", "terms": [{"name": "Parent"}, {"name": "Child"}]},
+            )
+        )
+    assert result["created"] == 1
+    assert result["failed"] == 1
+    assert result["failures"][0]["term"] == "Child"
+    assert "already committed" in result["note"]
+
+
+async def test_import_refuses_an_attribute_that_collides_with_a_system_column():
+    """A 'Description' column is read as the term's own field, not the attribute."""
+    fake = FakeViya()
+    colliding = {
+        **TERM_TYPE,
+        "attributes": [
+            *TERM_TYPE["attributes"],
+            {"name": "attr-desc", "label": "Description", "type": "single-line"},
+        ],
+    }
+    fake.overrides[f"GET /glossary/termTypes/{TERM_TYPE_ID}"] = colliding
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [{"name": "A", "attributes": {"Description": "x"}}],
+                },
+            )
+    assert "cannot be set by import" in str(excinfo.value)
+
+
+async def test_import_validates_attributes_before_sending_anything():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception, match="only accepts"):
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [{"name": "A", "attributes": {"Scope": "Nowhere"}}],
+                },
+            )
+    assert not [p for p in fake.posted if p["path"] == "/glossary/importTerms"]
+
+
+async def test_import_rejects_an_empty_batch():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception, match="nothing to import"):
+            await client.call_tool("import_glossary_terms", {"terms": []})
+
+
+async def test_update_can_move_a_term_to_a_new_parent():
+    """Published terms CAN be re-parented; the API allows it, verified live."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "update_glossary_term", {"term_id": TERM_ID, "parent_id": "gterm-newparent"}
+        )
+    assert fake.put_bodies[0]["parentId"] == "gterm-newparent"
+
+
+async def test_update_can_promote_a_term_to_a_root():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool("update_glossary_term", {"term_id": TERM_ID, "parent_id": ""})
+    assert fake.put_bodies[0]["parentId"] is None
+
+
+async def test_a_term_cannot_be_its_own_parent():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception, match="its own parent"):
+            await client.call_tool(
+                "update_glossary_term", {"term_id": TERM_ID, "parent_id": TERM_ID}
+            )
+    assert not fake.put_bodies
+
+
+async def test_update_leaves_the_parent_alone_when_not_given():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool("update_glossary_term", {"term_id": TERM_ID, "name": "Renamed"})
+    assert fake.put_bodies[0]["parentId"] == TERM["parentId"]

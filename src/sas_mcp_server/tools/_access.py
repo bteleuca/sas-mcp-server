@@ -173,6 +173,7 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "create_glossary_term_type",
         "update_glossary_term_type",
         "delete_glossary_term_type",
+        "import_glossary_terms",
         # Creates/removes a catalog relationship between a term and a column.
         "assign_glossary_term",
         "unassign_glossary_term",
@@ -215,6 +216,8 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
         # remove_attributes drops a definition, which stops every existing
         # term's stored value from being readable as that attribute.
         "update_glossary_term_type",
+        # update_existing=true overwrites a term already at that path.
+        "import_glossary_terms",
     }
 )
 

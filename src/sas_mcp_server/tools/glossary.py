@@ -33,6 +33,7 @@ traversal silently finds nothing rather than failing.
 """
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
@@ -42,15 +43,20 @@ from pydantic import BeforeValidator
 
 from ..config import VIYA_ENDPOINT
 from ..helpers.glossary_helpers import (
+    IMPORT_SYSTEM_COLUMNS,
     WIRE_FORMATS,
     attribute_maps,
     build_attribute_definitions,
+    build_term_csv,
     chunk_ids,
+    encode_attribute,
     encode_attributes,
     glossary_id_from_resource,
     matches_attribute_filter,
     missing_required,
+    parse_import_log,
     readable_attributes,
+    resolve_import_paths,
 )
 from ..viya_client import (
     JSONDict,
@@ -69,6 +75,7 @@ from ._common import coerce_json_dict, coerce_json_list, make_session_helpers
 AttributeMap = Annotated[dict[str, Any], BeforeValidator(coerce_json_dict)]
 # Same tolerance for the two list-shaped arguments the term-type tools take.
 AttributeSpecList = Annotated[list[dict[str, Any]], BeforeValidator(coerce_json_list)]
+TermRowList = Annotated[list[dict[str, Any]], BeforeValidator(coerce_json_list)]
 StringList = Annotated[list[str], BeforeValidator(coerce_json_list)]
 
 _GLOSSARY = "/glossary"
@@ -78,6 +85,7 @@ _COLLECTION_MEDIA = "application/vnd.sas.collection+json"
 _TERM_MEDIA = "application/vnd.sas.glossary.term+json"
 _TERM_TYPE_MEDIA = "application/vnd.sas.glossary.term.type+json"
 _SEARCH_MEDIA = "application/vnd.sas.metadata.search.collection+json"
+_JOB_MEDIA = "application/vnd.sas.job.execution.job+json"
 # The catalog instance representation that carries ``resourceId``. The default
 # (``application/json``) and the plain ``...metadata.instance+json`` both return
 # the field as absent rather than as an error, so a term→glossary bridge built
@@ -104,6 +112,10 @@ _SCAN_CAP = 2000
 # many term types has more than a caller can read; enough to spot the typo is
 # the useful amount.
 _LABELS_IN_ERROR = 40
+
+# How often to ask whether the bulk-import job has finished. A live import of
+# 60 terms took 26s, most of it job start-up, so polling faster only adds calls.
+_IMPORT_POLL_SECONDS = 2.0
 
 # Ceiling on the relationships one call may read. ``list_term_assets`` takes a
 # ``limit`` and this bounds it, the way fedsql_registry.MAX_LIMIT bounds
@@ -456,6 +468,66 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "allow_custom_attributes": term_type.get("allowCustomAttributes", False),
                 "attributes": attributes,
             }
+
+    # --- bulk import ---------------------------------------------------------
+
+    async def await_import_job(
+        client: httpx.AsyncClient, job_id: str, timeout_seconds: int
+    ) -> JSONDict:
+        """Poll a term-import job until it stops running.
+
+        The import is asynchronous — the POST returns 202 and a job — so there
+        is nothing to report until this finishes.
+        """
+        deadline = asyncio.get_running_loop().time() + max(1, timeout_seconds)
+        while True:
+            resp = await client.get(
+                f"{VIYA_ENDPOINT}/jobExecution/jobs/{job_id}", headers={"Accept": _JOB_MEDIA}
+            )
+            raise_for_viya_status(resp)
+            job = resp.json()
+            if job.get("state") in ("completed", "failed", "cancelled", "timedOut"):
+                return job
+            if asyncio.get_running_loop().time() >= deadline:
+                raise TimeoutError(
+                    f"the term import was still running after {timeout_seconds}s. It may yet "
+                    f"finish: check job {job_id} rather than importing again, or the terms "
+                    "that did land will collide on a retry."
+                )
+            await asyncio.sleep(_IMPORT_POLL_SECONDS)
+
+    def import_counts(job: JSONDict) -> dict[str, int]:
+        """The per-row tallies, which the job reports as a JSON *string*."""
+        raw = (job.get("results") or {}).get("counts")
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except ValueError:
+            return {}
+        return {k: v for k, v in parsed.items() if isinstance(v, int)}
+
+    async def import_failures(client: httpx.AsyncClient, job: JSONDict) -> list[JSONDict]:
+        """The per-row failures, read from the job's log.
+
+        The job's ``state`` is ``completed`` even when every row failed, and the
+        response carries no structured errors — the log is the only place that
+        names the row and the reason.
+        """
+        location = job.get("logLocation")
+        if not location:
+            return []
+        resp = await client.get(f"{VIYA_ENDPOINT}{location}/content")
+        if resp.status_code >= 400:
+            return [
+                {
+                    "term": None,
+                    "row": None,
+                    "error": f"the import log at {location} could not be read "
+                    f"(HTTP {resp.status_code}), so per-row failures are unavailable.",
+                }
+            ]
+        return parse_import_log(resp.text)
 
     # --- term type authoring -------------------------------------------------
 
@@ -1265,9 +1337,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         definition: str | None = None,
         description: str | None = None,
         label: str | None = None,
+        parent_id: str | None = None,
         attributes: AttributeMap | None = None,
     ) -> dict[str, Any]:
-        """Update a business term's text or custom attributes.
+        """Update a business term's text, parent or custom attributes.
 
         The glossary API replaces the whole term on update, so this reads the
         current one first and merges your changes into it: omitting an argument
@@ -1279,8 +1352,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         **required** must hold a value — including ones made required after this
         term was created. That is checked before the call, and reported by name.
 
-        A term's type cannot be changed after creation, nor can a published
-        term's parent.
+        A term's **type** cannot be changed after creation. Its **parent** can:
+        pass ``parent_id`` to move it, or ``""`` to make it a root term.
 
         Args:
             term_id: The glossary term UUID.
@@ -1288,6 +1361,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             definition: New definition.
             description: New description, max 1000 characters.
             label: New display label.
+            parent_id: Move the term under a different parent, or ``""`` to make
+                it a root term. A term cannot be its own ancestor.
             attributes: Custom attributes to change, keyed by label. Same value
                 forms as create_glossary_term — booleans as True/False,
                 multi-select as a list.
@@ -1321,6 +1396,11 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 body["description"] = description
             if label is not None:
                 body["label"] = label
+            if parent_id is not None:
+                if parent_id == term_id:
+                    raise ValueError("a term cannot be its own parent.")
+                # "" clears the parent, which is how a term becomes a root.
+                body["parentId"] = parent_id or None
             body["attributes"] = merged
 
             updated = await put_json(
@@ -1337,6 +1417,148 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "version": updated.get("version"),
                 "attributes": readable_attributes(updated.get("attributes"), by_uuid),
             }
+
+    @mcp.tool()
+    async def import_glossary_terms(
+        terms: TermRowList,
+        ctx: Context,
+        term_type: str | None = None,
+        update_existing: bool = False,
+        timeout_seconds: int = 600,
+    ) -> dict[str, Any]:
+        """Create many business terms, and their hierarchy, in one call.
+
+        Building a hierarchy one term at a time means a call per term *and* a
+        wait between levels, because a child needs the parent's id from the
+        previous response. This uses the glossary's own bulk import instead: one
+        request for the whole tree, with parents resolved by **name** rather than
+        by id, so nothing has to be threaded through.
+
+        Give each row a ``name`` and, for a child, a ``parent`` — the name of
+        another row in the same batch, or the path of a term that already exists
+        (levels separated by a backslash). Rows may be given in any order; they
+        are sorted so every parent is created before its children.
+
+        Attribute values take the same forms as ``create_glossary_term`` —
+        ``True``/``False`` for a boolean, a list for a multi-select — and are
+        validated here, per term type, before anything is sent.
+
+        **The import runs as a job and reports rows individually.** A row can
+        fail while the rest succeed, so the result carries ``created``,
+        ``failed`` and a ``failures`` list naming each bad row and why. Treat a
+        non-empty ``failures`` as a partial import: the successful rows are
+        already committed.
+
+        Args:
+            terms: The rows to create. Each is
+                ``{"name": ..., "parent": ..., "definition": ..., "attributes": {...}}``;
+                ``term_type`` may be given per row to mix types in one batch.
+            term_type: The term type for rows that do not name one.
+            update_existing: Overwrite a term that already exists at the same
+                path (default false, which fails that row instead).
+            timeout_seconds: How long to wait for the import job (default 600).
+        """
+        if not terms:
+            raise ValueError("terms is empty; there is nothing to import.")
+
+        async with viya_session("import_glossary_terms", ctx) as client:
+            # Resolve every term type named, so attributes can be validated and
+            # the type's real name written into the CSV.
+            type_names: dict[str, str] = {}
+            label_maps: dict[str, dict[str, JSONDict]] = {}
+
+            async def type_for(raw: str | None) -> tuple[str, dict[str, JSONDict]]:
+                wanted = (raw or term_type or "").strip()
+                if not wanted:
+                    raise ValueError(
+                        "no term type given. Set term_type for the batch, or a term_type "
+                        "on each row."
+                    )
+                if wanted not in type_names:
+                    resolved = await resolve_term_type_id(client, wanted)
+                    definition = await fetch_term_type(client, resolved)
+                    type_names[wanted] = definition.get("name", wanted)
+                    _, by_label = attribute_maps(definition)
+                    label_maps[wanted] = by_label
+                return type_names[wanted], label_maps[wanted]
+
+            rows: list[dict[str, Any]] = []
+            used_labels: dict[str, str] = {}
+            for row in terms:
+                if not isinstance(row, dict):
+                    # ValueError, not TypeError: it reaches the model as a plain
+                    # message rather than as an internal error, and it is the
+                    # caller's input that is wrong, not the code's.
+                    raise ValueError(f"each term must be an object; got {row!r}.")  # noqa: TRY004
+                name, by_label = await type_for(row.get("term_type"))
+                encoded: dict[str, Any] = {}
+                for label, value in (row.get("attributes") or {}).items():
+                    definition = by_label.get(str(label).strip().lower())
+                    if definition is None:
+                        valid = sorted(d.get("label", "") for d in by_label.values())
+                        raise ValueError(
+                            f"term {row.get('name')!r}: unknown attribute {label!r} for term "
+                            f"type {name!r}. Valid attributes: {valid}."
+                        )
+                    real = definition.get("label", "") or str(label)
+                    if real.strip().lower() in IMPORT_SYSTEM_COLUMNS:
+                        # The importer reads such a column as the term's own
+                        # field, so the attribute would be silently skipped and
+                        # the term rejected for missing it.
+                        raise ValueError(
+                            f"attribute {real!r} cannot be set by import: the CSV reads a "
+                            f"column of that name as the term's own {real.lower()}. Create "
+                            "these terms with create_glossary_term, or set this attribute "
+                            "afterwards with update_glossary_term."
+                        )
+                    used_labels[real.strip().lower()] = real
+                    value = encode_attribute(value, definition)
+                    encoded[real] = "true" if value is True else "false" if value is False else value
+                rows.append(
+                    {
+                        "name": row.get("name"),
+                        "term_type": name,
+                        "parent": row.get("parent"),
+                        # The import's Description column is the term's
+                        # definition — the field a reader actually sees.
+                        "description": row.get("definition") or row.get("description") or "",
+                        "attributes": encoded,
+                    }
+                )
+
+            ordered = resolve_import_paths(rows)
+            columns = [used_labels[key] for key in sorted(used_labels)]
+            payload = build_term_csv(ordered, columns)
+
+            started = await client.post(
+                f"{VIYA_ENDPOINT}{_GLOSSARY}/importTerms",
+                headers={"Accept": _JOB_MEDIA},
+                files={"termCSV": ("terms.csv", payload.encode(), "text/csv")},
+                data={"updateExisting": "true" if update_existing else "false"},
+            )
+            raise_for_viya_status(started)
+            job_id = started.json().get("id", "")
+
+            job = await await_import_job(client, job_id, timeout_seconds)
+            counts = import_counts(job)
+            failures = await import_failures(client, job)
+            created = counts.get("successful", len(ordered) - len(failures))
+            result: dict[str, Any] = {
+                "requested": len(ordered),
+                "created": created,
+                "failed": counts.get("errors", len(failures)),
+                "job_id": job_id,
+                "order": [row["name"] for row in ordered],
+                "failures": failures,
+            }
+            if failures:
+                # The job's own state is "completed" even when every row failed,
+                # so saying this plainly is the only way a caller learns of it.
+                result["note"] = (
+                    f"{created} of {len(ordered)} term(s) were created; the rest failed and "
+                    "are listed in 'failures'. The successful ones are already committed."
+                )
+            return result
 
     @mcp.tool()
     async def delete_glossary_term(term_id: str, ctx: Context) -> dict[str, str]:

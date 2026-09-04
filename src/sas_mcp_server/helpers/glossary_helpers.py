@@ -24,6 +24,8 @@ Two of the glossary's shapes need translating before a caller can work with them
   :data:`WIRE_FORMATS` states the formats; :func:`encode_attribute` enforces them.
 """
 
+import csv
+import io
 import re
 import uuid
 from datetime import datetime, timedelta
@@ -518,7 +520,159 @@ def matches_attribute_filter(readable: dict[str, Any], wanted: dict[str, Any]) -
     return True
 
 
+# The columns the import reads as the term itself rather than as a custom
+# attribute. The first occurrence of one of these names in the header wins, so
+# an attribute sharing one of these labels cannot be set through an import.
+IMPORT_SYSTEM_COLUMNS: tuple[str, ...] = (
+    "name",
+    "type",
+    "path",
+    "description",
+    "requirements",
+    "status",
+)
+
+# The import expresses the hierarchy as a path in the ``Path`` column, separated
+# by a backslash — which is why a term name may not contain one, though a
+# forward slash is fine. Verified against a live import building three levels.
+PATH_SEPARATOR = "\\"
+
+_IMPORT_FAILURE_RE = re.compile(
+    r"Import failed for term \((?P<term>.*?)\) on row (?P<row>\d+)\. Error: (?P<error>.*)"
+)
+
+
+def resolve_import_paths(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order rows parent-first and turn each ``parent`` into a full path.
+
+    The import resolves a row's parent by looking up the ``Path`` column against
+    terms that already exist *or* that earlier rows of the same file have just
+    created. So a child must follow its parent, and must name the parent's whole
+    path rather than only its name — get either wrong and the row fails with
+    ``A parent term with the path "..." does not exist``.
+
+    A caller should have to know neither. Each row names its ``parent`` — another
+    row in the batch, or an existing term's path — and this produces the full
+    path and an order that works.
+
+    Raises :class:`ValueError` for a duplicate name or a circular parent chain,
+    both of which would otherwise surface as a confusing per-row failure.
+    """
+    by_name: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = str(row.get("name", "")).strip()
+        if not name:
+            raise ValueError("every term needs a 'name'.")
+        if PATH_SEPARATOR in name:
+            raise ValueError(
+                f"term name {name!r} contains a backslash, which separates the levels of an "
+                "import path and so cannot appear in a name. A forward slash is fine."
+            )
+        key = name.lower()
+        if key in by_name:
+            raise ValueError(f"term name {name!r} appears twice in this batch.")
+        by_name[key] = row
+
+    resolved: dict[str, str] = {}
+    ordered: list[dict[str, Any]] = []
+    visiting: set[str] = set()
+
+    def place(row: dict[str, Any]) -> str:
+        """Return this row's parent path, having emitted its ancestors first."""
+        name = str(row["name"]).strip()
+        key = name.lower()
+        if key in resolved:
+            return resolved[key]
+        if key in visiting:
+            raise ValueError(
+                f"the parent chain through {name!r} is circular; a term cannot be its own "
+                "ancestor."
+            )
+        visiting.add(key)
+        parent = str(row.get("parent", "") or "").strip()
+        if not parent:
+            prefix = ""
+        elif parent.lower() in by_name:
+            parent_row = by_name[parent.lower()]
+            grandparent = place(parent_row)
+            prefix = (
+                f"{grandparent}{PATH_SEPARATOR}{parent_row['name']}"
+                if grandparent
+                else str(parent_row["name"])
+            )
+        else:
+            # Not in this batch, so it must already exist; take it as a path.
+            prefix = parent
+        visiting.discard(key)
+        resolved[key] = prefix
+        ordered.append({**row, "_path": prefix})
+        return prefix
+
+    for row in rows:
+        place(row)
+    return ordered
+
+
+def build_term_csv(rows: list[dict[str, Any]], attribute_columns: list[str]) -> str:
+    """Render ordered rows as the CSV the import expects.
+
+    *rows* come from :func:`resolve_import_paths`, so each carries ``_path``.
+    Values are already encoded — a boolean as ``true``/``false``, a multi-select
+    as its comma-joined string — so this only quotes and joins them.
+    """
+    header = ["Name", "Type", "Path", "Description", *attribute_columns]
+    buffer = io.StringIO()
+    # Records are CRLF-terminated, as a CSV export from the UI produces.
+    writer = csv.writer(buffer, lineterminator="\r\n")
+    writer.writerow(header)
+    for row in rows:
+        attributes = row.get("attributes") or {}
+        lowered = {str(key).strip().lower(): value for key, value in attributes.items()}
+        writer.writerow(
+            [
+                row.get("name", ""),
+                row.get("term_type", "") or "",
+                row.get("_path", ""),
+                row.get("description", "") or "",
+                *[lowered.get(label.strip().lower(), "") for label in attribute_columns],
+            ]
+        )
+    return buffer.getvalue()
+
+
+def parse_import_log(text: str) -> list[dict[str, Any]]:
+    """Pull the per-row failures out of an import job's log.
+
+    The job reports ``completed`` even when every row failed, so the log is the
+    only place that says what went wrong. Each failure names the term, the row
+    and the reason; a line that does not parse is kept verbatim rather than
+    dropped.
+    """
+    failures: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("Import failed"):
+            continue
+        match = _IMPORT_FAILURE_RE.match(line)
+        if match:
+            failures.append(
+                {
+                    "term": match.group("term"),
+                    "row": int(match.group("row")),
+                    "error": match.group("error").strip(),
+                }
+            )
+        else:
+            failures.append({"term": None, "row": None, "error": line})
+    return failures
+
+
 __all__ = [
+    "resolve_import_paths",
+    "parse_import_log",
+    "build_term_csv",
+    "PATH_SEPARATOR",
+    "IMPORT_SYSTEM_COLUMNS",
     "ATTRIBUTE_TYPES",
     "ID_CHUNK",
     "WIRE_FORMATS",
