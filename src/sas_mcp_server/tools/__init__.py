@@ -34,6 +34,7 @@ from . import (
     data_ops,
     decisioning,
     discovery,
+    glossary,
     jobs,
     model_scoring,
     reports,
@@ -61,6 +62,7 @@ _TIER_REGISTRARS: dict[int, Registrar] = {
     6: model_scoring.register,
     7: decisioning.register,
     8: workbench.register,
+    9: glossary.register,
 }
 
 TIER_TITLES: dict[int, str] = {
@@ -73,6 +75,7 @@ TIER_TITLES: dict[int, str] = {
     6: "Model Management & Scoring",
     7: "Decisioning (SAS Intelligent Decisioning)",
     8: "Workbench (Execute Code Only)",
+    9: "Business Glossary (SAS Data Governance)",
 }
 
 ALL_TIERS: frozenset[int] = frozenset(_TIER_REGISTRARS)

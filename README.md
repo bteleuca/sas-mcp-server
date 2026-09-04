@@ -4,7 +4,7 @@ A Model Context Protocol (MCP) server for executing SAS code, training AutoML pr
 
 ## Features
 
-- 75 tools across 9 selectable tiers, spanning the Analytics Life Cycle on SAS Viya
+- 87 tools across 10 selectable tiers, spanning the Analytics Life Cycle on SAS Viya
 - Prompt Templates for improving your SAS Code
 - OAuth2 authentication with PKCE flow
 - HTTP-based MCP server compatible with MCP clients
@@ -156,6 +156,7 @@ Tools are grouped into numbered tiers. By default the server exposes all of them
 | 6 | Model Management & Scoring |
 | 7 | Decisioning (SAS Intelligent Decisioning) |
 | 8 | Workbench (Execute Code Only) |
+| 9 | Business Glossary (SAS Data Governance) |
 
 ```sh
 # Example: expose only compute/discovery/data-ops and reporting
@@ -164,7 +165,7 @@ MCP_TIERS=0-3 uv run app
 
 ### Read-only mode
 
-Set `MCP_READ_ONLY=true` to expose only tools that neither change server-side state nor cause server-side work — 43 of the 75 tools. Withheld tools are never registered, so they are absent from the client's tool list entirely: the model cannot see them, so it cannot attempt them.
+Set `MCP_READ_ONLY=true` to expose only tools that neither change server-side state nor cause server-side work — 50 of the 87 tools. Withheld tools are never registered, so they are absent from the client's tool list entirely: the model cannot see them, so it cannot attempt them.
 
 This is a filter over the tiers, not a tier of its own — the read/write split cuts across every tier (Tier 3 has both `get_report` and `delete_report`). The two settings compose:
 
@@ -295,6 +296,33 @@ Build and manage SAS Intelligent Decisioning rule sets and decision flows end to
 
 #### Tier 8 — Workbench (Execute Code Only)
 - **execute_sas_code**: Execute SAS code snippets and retrieve execution results (log and listing output). Runs in a reusable compute session that is kept warm across calls, so SAS state (WORK tables, macro variables, assigned librefs) persists between successive calls
+
+#### Tier 9 — Business Glossary (SAS Data Governance)
+
+Read and author the SAS Business Glossary, and link its terms to the columns they describe. Tier 1 tells you a column is called `CD_NAC_RSK`; this tier tells you what that means and who says so.
+
+Two things about the glossary are worth knowing before you start, because both are invisible in the raw API and both are handled for you here:
+
+- **A term has two ids.** It exists as a Glossary object *and* as a Catalog entity, with different identifiers. Every tool returns both — `term_id` (glossary) and `catalog_entity_id` (catalog) — so you never have to work out which one you are holding.
+- **Custom attributes are stored under UUID keys.** These tools read and write them by the **label** the glossary UI shows (`{"Scope": "Group"}`), validating required attributes and single-select values before the call is made.
+
+*Dictionary:*
+- **search_glossary_terms**: Free-text, ranked search over term names and definitions — the way in when you know a word rather than an id. Reports `assigned_asset_count`, so you can see whether a term is actually in use
+- **list_glossary_terms**: Exact structural listing — by term type, by parent (the authoritative hierarchy), or by name fragment
+- **get_glossary_term**: One term in full, with its custom attributes named rather than hashed
+- **list_glossary_term_types** / **get_glossary_term_type**: The term types available, and the attribute contract a term of that type must satisfy — call the latter before authoring
+
+*Where terms meet data:*
+- **list_term_assets**: The columns a term is attached to, with their tables. The authoritative answer to "where is this term used?"
+- **list_table_terms**: The reverse — every column of a table and the term assigned to it, with the term's definition inline. The fastest read on whether a table is governed
+
+*Authoring:*
+- **create_glossary_term**: Create a term. **Publishes by default** — the underlying API creates an invisible draft unless told otherwise
+- **update_glossary_term**: Change a term's text or attributes. Merges onto the current term, so omitted fields are left alone rather than blanked
+- **delete_glossary_term**: Permanently delete a term and every assignment that referenced it
+- **assign_glossary_term** / **unassign_glossary_term**: Attach a term to a table column, or detach it. This is the step that makes a term govern data — a term with no assigned assets governs nothing
+
+Terms assigned this way also become searchable through Tier 1's **catalog_search** using the `Column.term:"<term name>"` facet on the `datasets` index, which returns the tables carrying a term without resolving individual columns.
 
 ### Prompt Templates
 
@@ -517,7 +545,7 @@ tsv, and `file_path`/`data_format` coverage needs no extra deps. Generating a
 `sas7bdat`/`sashdat` fixture requires SAS itself, so those two formats are covered by
 unit-level payload tests only, not live.
 
-Every one of the 75 tools and 9 prompt templates has an integration test, enforced by the
+Every one of the 87 tools and 9 prompt templates has an integration test, enforced by the
 `test_every_tool_has_integration_coverage` / `test_every_prompt_has_integration_coverage`
 guards — adding a new tool or prompt without integration coverage fails the suite. The
 resource-dependent tests discover real targets on the instance: `score_data` scores the most
@@ -553,7 +581,7 @@ gh gist create reports/integration.xml                          # full XML as a 
 
 | File | Description |
 |---|---|
-| `tests/test_tool_payloads.py` | Payload assertions for all 75 tools (URL paths, JSON body, query params, headers) plus error-path coverage |
+| `tests/test_tool_payloads.py` | Payload assertions for all 75 Tier 0-8 tools (URL paths, JSON body, query params, headers) plus error-path coverage |
 | `tests/test_integration.py` | End-to-end workflow tests against a real Viya instance |
 | `tests/test_tools.py` | Unit tests for the generic Viya REST helpers in `viya_client` (`get_json`, `post_json`, `make_client`, …) |
 | `tests/test_viya_utils.py` | Unit tests for Viya compute session and job orchestration |

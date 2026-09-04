@@ -227,16 +227,36 @@ def return_items(
     return results
 
 
+def filter_literal(value: str | None) -> str:
+    """Escape *value* for use inside a Viya filter string literal.
+
+    Single quotes are doubled per the Viya filter grammar, so a value like
+    ``O'Brien`` produces a valid filter instead of a malformed one that Viya
+    rejects with HTTP 400. Every filter builder here goes through this, so the
+    escaping rule is stated once rather than re-derived per call site.
+    """
+    return (value or "").replace("'", "''")
+
+
 def contains_filter(value: str | None, field: str = "name") -> str | None:
     """Build a Viya ``contains(field,'value')`` substring filter, or ``None``.
 
     Returns ``None`` for an empty *value*, so callers can pass the result
-    straight to :func:`get_paged_items`' ``filters`` argument. Single quotes in
-    *value* are doubled per the Viya filter string-literal escaping rules, so a
-    value like ``O'Brien`` produces a valid filter instead of a malformed one
-    that Viya rejects with HTTP 400.
+    straight to :func:`get_paged_items`' ``filters`` argument. See
+    :func:`filter_literal` for the quoting.
     """
     if not value:
         return None
-    escaped = value.replace("'", "''")
-    return f"contains({field},'{escaped}')"
+    return f"contains({field},'{filter_literal(value)}')"
+
+
+def in_filter(field: str, values: list[str]) -> str:
+    """Build a Viya ``in(field,'a','b',...)`` set-membership filter.
+
+    The batched counterpart to :func:`contains_filter`: one request can ask
+    about many ids instead of one per id. Callers are responsible for keeping
+    the value list short enough that the resulting query string is accepted —
+    a filter naming several hundred UUIDs builds a URL the gateway rejects.
+    """
+    joined = "','".join(filter_literal(value) for value in values)
+    return f"in({field},'{joined}')"

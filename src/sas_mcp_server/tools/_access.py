@@ -101,6 +101,14 @@ READ_ONLY_TOOLS: frozenset[str] = frozenset(
         "get_decision_flow_code",
         "list_decision_flow_revisions",
         "get_decision_flow_revision",
+        # Tier 9 — Business Glossary
+        "list_glossary_term_types",
+        "get_glossary_term_type",
+        "search_glossary_terms",
+        "list_glossary_terms",
+        "get_glossary_term",
+        "list_term_assets",
+        "list_table_terms",
     }
 )
 
@@ -156,6 +164,13 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "delete_decision_flow",
         "lock_decision_flow_revision",
         "publish_decision_flow",
+        # Tier 9
+        "create_glossary_term",
+        "update_glossary_term",
+        "delete_glossary_term",
+        # Creates/removes a catalog relationship between a term and a column.
+        "assign_glossary_term",
+        "unassign_glossary_term",
     }
 )
 
@@ -185,6 +200,11 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
         "create_report",  # on_conflict="replace" can overwrite a report
         "copy_report",  # result_name_conflict="replace" likewise
         "publish_ml_champion_model",  # re-publish replaces the destination module
+        "delete_glossary_term",
+        "unassign_glossary_term",  # removes an existing term/column assignment
+        # PUT replaces the whole term; the tool merges first, but a caller can
+        # still overwrite a definition or an attribute that was already set.
+        "update_glossary_term",
     }
 )
 
@@ -205,6 +225,12 @@ IDEMPOTENT_WRITE_TOOLS: frozenset[str] = frozenset(
         "cancel_job",
         "reset_compute_session",
         "promote_table_to_memory",
+        "update_glossary_term",
+        "delete_glossary_term",
+        # Both check for the existing link first and report it rather than
+        # creating a duplicate or failing on an absent one.
+        "assign_glossary_term",
+        "unassign_glossary_term",
     }
 )
 
