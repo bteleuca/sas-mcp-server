@@ -235,6 +235,14 @@ class FakeViya:
             return self._json({"items": [TERM], "count": 1})
         if method == "GET" and path.startswith("/glossary/terms/"):
             return self._json(TERM)
+        if method == "POST" and path == "/glossary/termTypes":
+            body = json.loads(request.content)
+            self.posted.append({"path": path, "body": body, "params": dict(request.url.params)})
+            return self._json({**body, "id": "tt-new", "usageCount": 0}, 201)
+        if method == "PUT" and path.startswith("/glossary/termTypes/"):
+            body = json.loads(request.content)
+            self.put_bodies.append(body)
+            return self._json({**body, "version": 2})
         if method == "POST" and path == "/glossary/terms":
             body = json.loads(request.content)
             self.posted.append({"path": path, "body": body, "params": dict(request.url.params)})
@@ -1123,3 +1131,137 @@ async def test_assign_reports_an_indexing_gap_rather_than_a_bad_column_name():
     message = str(excinfo.value)
     assert "indexing gap" in message
     assert "catalog_run_agent" in message
+
+
+# --- term type authoring ------------------------------------------------------
+
+
+def test_attribute_definitions_get_generated_identifiers():
+    """The API will not mint them and rejects the omission unhelpfully."""
+    built = gh.build_attribute_definitions(
+        [{"label": "Scope", "type": "single-select", "allowed_values": ["A", "B"]}]
+    )
+    assert len(built) == 1
+    assert built[0]["label"] == "Scope"
+    assert built[0]["items"] == ["A", "B"]
+    assert len(built[0]["name"]) == 36  # a UUID
+
+
+def test_editing_an_attribute_keeps_its_identifier():
+    """Minting a new one orphans every stored value under the old key."""
+    existing = [{"name": "attr-keep", "label": "Scope", "type": "single-select", "items": ["A"]}]
+    built = gh.build_attribute_definitions(
+        [{"label": "scope", "type": "single-select", "allowed_values": ["A", "B"], "required": True}],
+        existing,
+    )
+    assert built[0]["name"] == "attr-keep", "the UUID must survive an edit"
+    assert built[0]["items"] == ["A", "B"]
+    assert built[0]["required"] is True
+
+
+def test_unmentioned_attributes_survive_an_edit():
+    existing = [
+        {"name": "a1", "label": "Scope", "type": "single-line"},
+        {"name": "a2", "label": "Notes", "type": "multi-line"},
+    ]
+    built = gh.build_attribute_definitions([{"label": "Scope", "type": "single-line"}], existing)
+    assert {d["label"] for d in built} == {"Scope", "Notes"}
+
+
+def test_attributes_can_be_removed_by_label():
+    existing = [
+        {"name": "a1", "label": "Scope", "type": "single-line"},
+        {"name": "a2", "label": "Notes", "type": "multi-line"},
+    ]
+    built = gh.build_attribute_definitions(None, existing, remove=["notes"])
+    assert [d["label"] for d in built] == ["Scope"]
+
+
+def test_removing_an_attribute_that_does_not_exist_is_refused():
+    existing = [{"name": "a1", "label": "Scope", "type": "single-line"}]
+    with pytest.raises(ValueError, match="no such attribute"):
+        gh.build_attribute_definitions(None, existing, remove=["Nope"])
+
+
+def test_a_select_attribute_without_options_is_refused():
+    """Nothing could ever be stored in it, and Viya accepts the definition."""
+    with pytest.raises(ValueError, match="allowed_values"):
+        gh.build_attribute_definitions([{"label": "Scope", "type": "single-select"}])
+
+
+def test_an_unknown_attribute_type_lists_the_valid_ones():
+    with pytest.raises(ValueError) as excinfo:
+        gh.build_attribute_definitions([{"label": "Scope", "type": "dropdown"}])
+    assert "single-select" in str(excinfo.value)
+
+
+def test_duplicate_attribute_labels_are_refused():
+    with pytest.raises(ValueError, match="twice"):
+        gh.build_attribute_definitions(
+            [{"label": "Scope", "type": "single-line"}, {"label": "scope", "type": "multi-line"}]
+        )
+
+
+async def test_create_term_type_defaults_the_label_and_sends_definitions():
+    """The API leaves label empty rather than defaulting it, showing as a blank."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "create_glossary_term_type",
+                {
+                    "name": "Risk Terms",
+                    "attributes": [
+                        {"label": "Scope", "type": "single-select", "allowed_values": ["A", "B"]},
+                        {"label": "Owned", "type": "boolean", "default": False},
+                    ],
+                },
+            )
+        )
+    body = next(p for p in fake.posted if p["path"] == "/glossary/termTypes")["body"]
+    assert body["label"] == "Risk Terms"
+    assert [a["label"] for a in body["attributes"]] == ["Scope", "Owned"]
+    # A term type's default is a string even for a boolean, unlike a term's value.
+    assert body["attributes"][1]["defaultValue"] == "false"
+    assert result["term_type_id"] == "tt-new"
+
+
+async def test_update_term_type_preserves_identifiers_of_untouched_attributes():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "update_glossary_term_type",
+            {
+                "term_type_id": TERM_TYPE_ID,
+                "attributes": [{"label": "Scope", "type": "single-select",
+                                "allowed_values": ["Local", "Group", "Regional"]}],
+            },
+        )
+    sent = {a["label"]: a for a in fake.put_bodies[0]["attributes"]}
+    assert sent["Scope"]["name"] == "attr-scope", "editing must not re-key the attribute"
+    assert sent["Scope"]["items"] == ["Local", "Group", "Regional"]
+    assert "Notes" in sent, "attributes the caller did not mention must survive"
+
+
+async def test_delete_term_type_refuses_while_terms_use_it():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "delete_glossary_term_type", {"term_type_id": TERM_TYPE_ID}
+            )
+    assert "used by 3 term(s)" in str(excinfo.value)
+    assert not fake.deleted
+
+
+async def test_delete_term_type_proceeds_with_force():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "delete_glossary_term_type", {"term_type_id": TERM_TYPE_ID, "force": True}
+            )
+        )
+    assert result["status"] == "deleted"
+    assert result["terms_affected"] == 3
+    assert fake.deleted == [f"/glossary/termTypes/{TERM_TYPE_ID}"]

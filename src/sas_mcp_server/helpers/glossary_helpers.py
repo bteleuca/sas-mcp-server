@@ -25,6 +25,7 @@ Two of the glossary's shapes need translating before a caller can work with them
 """
 
 import re
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -49,6 +50,7 @@ _TERM_RESOURCE_RE = re.compile(r"/glossary/terms/([^/]+)$")
 # visible before a write, not after a 400.
 WIRE_FORMATS: dict[str, str] = {
     "boolean": "JSON true/false (not the strings 'true'/'false')",
+    "single-select": "exactly one of the allowed values",
     "multi-select": "one or more of the allowed values; pass a list",
     "date": "yyyy-mm-dd",
     "date-time": "yyyy-mm-ddThh:mm:ssZ (UTC; offsets are converted)",
@@ -99,10 +101,10 @@ def attribute_maps(term_type: JSONDict) -> tuple[dict[str, JSONDict], dict[str, 
     by_uuid: dict[str, JSONDict] = {}
     by_label: dict[str, JSONDict] = {}
     for definition in term_type.get("attributes", []) or []:
-        uuid = definition.get("name", "")
-        if uuid:
-            label = definition.get("label", "") or uuid
-            by_uuid[uuid] = definition
+        attribute_id = definition.get("name", "")
+        if attribute_id:
+            label = definition.get("label", "") or attribute_id
+            by_uuid[attribute_id] = definition
             by_label[label.strip().lower()] = definition
     return by_uuid, by_label
 
@@ -130,14 +132,14 @@ def readable_attributes(
     discarded, so nothing is silently lost when a term type has been edited.
     """
     readable: dict[str, Any] = {}
-    for uuid, value in (raw or {}).items():
+    for attribute_id, value in (raw or {}).items():
         if value in (None, ""):
             continue
-        definition = by_uuid.get(uuid)
+        definition = by_uuid.get(attribute_id)
         if definition is None:
-            readable[uuid] = value
+            readable[attribute_id] = value
             continue
-        readable[definition.get("label", "") or uuid] = decode_attribute(value, definition)
+        readable[definition.get("label", "") or attribute_id] = decode_attribute(value, definition)
     return readable
 
 
@@ -357,10 +359,131 @@ def missing_required(merged: dict[str, Any], by_label: dict[str, JSONDict]) -> l
     )
 
 
+
+# The attribute types the glossary understands. A term type can declare no
+# others, and the service rejects an unknown one with a message that does not
+# say what the valid set is.
+ATTRIBUTE_TYPES: tuple[str, ...] = (
+    "single-line",
+    "multi-line",
+    "single-select",
+    "multi-select",
+    "boolean",
+    "date",
+    "date-time",
+    "time",
+)
+
+# Types whose values are chosen from a fixed list, so a definition without one
+# is a term type nobody can write to.
+_CHOICE_TYPES = ("single-select", "multi-select")
+
+
+def build_attribute_definitions(
+    specs: list[dict[str, Any]] | None,
+    existing: list[JSONDict] | None = None,
+    *,
+    remove: list[str] | None = None,
+) -> list[JSONDict]:
+    """Turn caller-friendly attribute specs into the definitions the API stores.
+
+    Each definition is keyed by a UUID in its ``name`` field, and **that UUID is
+    what every existing term's stored values are filed under**. So an edit
+    matches an incoming spec to an existing definition *by label* and keeps its
+    UUID: mint a fresh one and every term of that type silently loses the value,
+    with the old key left orphaned in its attribute map.
+
+    The API will not mint the UUIDs itself — omitting them fails with ``The
+    value for field "name" must be unique``, which names neither the attribute
+    nor the real problem.
+
+    Args:
+        specs: ``{label, type, required?, allowed_values?, default?, description?}``
+            per attribute. ``None`` keeps *existing* untouched.
+        existing: the type's current definitions, whose UUIDs are preserved.
+        remove: labels to drop. Terms keep the stored value under its now
+            unknown UUID rather than losing it outright.
+    """
+    by_label = {
+        (d.get("label") or "").strip().lower(): d for d in (existing or []) if d.get("label")
+    }
+    dropped = {label.strip().lower() for label in (remove or [])}
+    unknown = dropped - by_label.keys()
+    if unknown:
+        raise ValueError(
+            f"cannot remove attribute(s) {sorted(unknown)}: this term type has no such "
+            f"attribute. It declares {sorted(by_label)}."
+        )
+
+    if specs is None:
+        kept = [d for d in (existing or []) if (d.get("label") or "").strip().lower() not in dropped]
+        return kept
+
+    built: list[JSONDict] = []
+    seen: set[str] = set()
+    for spec in specs:
+        label = str(spec.get("label", "")).strip()
+        if not label:
+            raise ValueError("every attribute needs a 'label'.")
+        key = label.lower()
+        if key in seen:
+            raise ValueError(f"attribute label '{label}' is given twice; labels must be unique.")
+        seen.add(key)
+
+        attr_type = str(spec.get("type", "")).strip().lower()
+        if attr_type not in ATTRIBUTE_TYPES:
+            raise ValueError(
+                f"attribute '{label}' has type {attr_type or '(missing)'!r}; valid types are "
+                f"{list(ATTRIBUTE_TYPES)}."
+            )
+
+        allowed = spec.get("allowed_values") or spec.get("items") or []
+        if attr_type in _CHOICE_TYPES and not allowed:
+            raise ValueError(
+                f"attribute '{label}' is a {attr_type}, so it needs 'allowed_values' — "
+                "without them no value can ever be stored in it."
+            )
+        if allowed and attr_type not in _CHOICE_TYPES:
+            raise ValueError(
+                f"attribute '{label}' is a {attr_type}, which takes no 'allowed_values'; "
+                f"only {list(_CHOICE_TYPES)} do."
+            )
+
+        previous = by_label.get(key)
+        definition: JSONDict = {
+            # Reuse the existing UUID so terms already carrying a value keep it.
+            "name": (previous or {}).get("name") or str(uuid.uuid4()),
+            "label": label,
+            "type": attr_type,
+        }
+        if spec.get("required"):
+            definition["required"] = True
+        if allowed:
+            definition["items"] = [str(item) for item in allowed]
+        default = spec.get("default", spec.get("defaultValue"))
+        if default not in (None, ""):
+            # Stored as a string even for a boolean, unlike a term's own value.
+            definition["defaultValue"] = (
+                str(default).lower() if isinstance(default, bool) else str(default)
+            )
+        if spec.get("description"):
+            definition["description"] = str(spec["description"])
+        built.append(definition)
+
+    # Anything the caller did not mention survives, unless explicitly removed —
+    # the same merge rule update_glossary_term uses for a term's own fields.
+    for key, definition in by_label.items():
+        if key not in seen and key not in dropped:
+            built.append(definition)
+    return built
+
+
 __all__ = [
+    "ATTRIBUTE_TYPES",
     "ID_CHUNK",
     "WIRE_FORMATS",
     "attribute_maps",
+    "build_attribute_definitions",
     "chunk_ids",
     "decode_attribute",
     "encode_attribute",

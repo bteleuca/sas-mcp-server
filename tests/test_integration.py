@@ -1614,6 +1614,9 @@ TOOL_COVERAGE = {
     "delete_glossary_term": "test_glossary_workflow",
     "assign_glossary_term": "test_glossary_workflow",
     "unassign_glossary_term": "test_glossary_workflow",
+    "create_glossary_term_type": "test_glossary_term_type_lifecycle",
+    "update_glossary_term_type": "test_glossary_term_type_lifecycle",
+    "delete_glossary_term_type": "test_glossary_term_type_lifecycle",
 }
 
 
@@ -2073,3 +2076,117 @@ async def test_glossary_workflow(integration_mcp_server):
                     await client.call_tool("delete_glossary_term", {"term_id": created_id})
                 ).data
                 assert deleted["status"] == "deleted"
+
+
+async def test_glossary_term_type_lifecycle(integration_mcp_server):
+    """Design a term type, use it, evolve it, and delete it.
+
+    The point of the evolve step is that an attribute keeps its identifier: a
+    term's stored values are filed under it, so re-minting one would leave every
+    existing term's value orphaned under a key nothing names.
+    """
+    type_name = f"MCP_TEST_TYPE_{_SUFFIX}"
+    type_id = term_id = None
+    async with Client(integration_mcp_server) as client:
+        try:
+            created = (
+                await client.call_tool(
+                    "create_glossary_term_type",
+                    {
+                        "name": type_name,
+                        "description": "Integration test. Safe to delete.",
+                        "attributes": [
+                            {"label": "Owner", "type": "single-line", "required": True},
+                            {
+                                "label": "Tier",
+                                "type": "single-select",
+                                "allowed_values": ["Gold", "Silver"],
+                            },
+                            {"label": "Masked", "type": "boolean", "default": False},
+                        ],
+                    },
+                )
+            ).data
+            type_id = created["term_type_id"]
+            assert created["label"] == type_name, "label must default from name"
+            before = {a["label"]: a["attribute_id"] for a in created["attributes"]}
+            assert set(before) == {"Owner", "Tier", "Masked"}
+
+            # A term of the new type, exercising every value form at once.
+            term = (
+                await client.call_tool(
+                    "create_glossary_term",
+                    {
+                        "name": f"MCP_TEST_TYPED_TERM_{_SUFFIX}",
+                        "term_type": type_id,
+                        "definition": "Integration test term.",
+                        "attributes": {"Owner": "data-office", "Tier": "Gold", "Masked": True},
+                    },
+                )
+            ).data
+            term_id = term["term_id"]
+            assert term["attributes"]["Masked"] is True, "a boolean must survive as a boolean"
+
+            # Deleting a type in use would take those definitions with it.
+            with pytest.raises(Exception, match="term"):
+                await client.call_tool("delete_glossary_term_type", {"term_type_id": type_id})
+
+            evolved = (
+                await client.call_tool(
+                    "update_glossary_term_type",
+                    {
+                        "term_type_id": type_id,
+                        "attributes": [
+                            {
+                                "label": "Tier",
+                                "type": "single-select",
+                                "allowed_values": ["Gold", "Silver", "Bronze"],
+                            },
+                            {"label": "Review date", "type": "date"},
+                        ],
+                    },
+                )
+            ).data
+            after = {a["label"]: a for a in evolved["attributes"]}
+            assert set(after) == {"Owner", "Tier", "Masked", "Review date"}
+            assert after["Tier"]["attribute_id"] == before["Tier"], "identifier must survive"
+            assert after["Owner"]["attribute_id"] == before["Owner"]
+            assert after["Tier"]["allowed_values"] == ["Gold", "Silver", "Bronze"]
+
+            # The existing term still reads its values, which is what the
+            # preserved identifiers actually buy.
+            back = (await client.call_tool("get_glossary_term", {"term_id": term_id})).data
+            assert back["attributes"]["Owner"] == "data-office"
+            assert back["attributes"]["Masked"] is True
+
+            # The widened option and the new attribute are usable on it.
+            updated = (
+                await client.call_tool(
+                    "update_glossary_term",
+                    {
+                        "term_id": term_id,
+                        "attributes": {"Tier": "Bronze", "Review date": "2027-01-31"},
+                    },
+                )
+            ).data
+            assert updated["attributes"]["Tier"] == "Bronze"
+            assert updated["attributes"]["Review date"] == "2027-01-31"
+
+            dropped = (
+                await client.call_tool(
+                    "update_glossary_term_type",
+                    {"term_type_id": type_id, "remove_attributes": ["Review date"]},
+                )
+            ).data
+            assert "Review date" not in {a["label"] for a in dropped["attributes"]}
+        finally:
+            if term_id:
+                await client.call_tool("delete_glossary_term", {"term_id": term_id})
+            if type_id:
+                gone = (
+                    await client.call_tool(
+                        "delete_glossary_term_type",
+                        {"term_type_id": type_id, "force": True},
+                    )
+                ).data
+                assert gone["status"] == "deleted"

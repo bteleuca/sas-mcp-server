@@ -11,6 +11,11 @@
 - **Assigning a term to a table the catalog indexed *without* its columns reported a wrong column name.** With no columns indexed, every name looks wrong and the error listed an empty set of alternatives. It now names the indexing gap and points at `catalog_run_agent`.
 
 ### Added
+- **Term types can now be designed through MCP, not only read.** `create_glossary_term_type`, `update_glossary_term_type` and `delete_glossary_term_type` complete the tier: a glossary could previously be read and populated through these tools but never *designed* through them, so any deployment wanting a custom type needed a SAS UI step first. Attributes are declared as `{"label": ..., "type": ...}` plus optional `required`, `allowed_values`, `default` and `description`.
+  - **An edit keeps each attribute's identifier.** Attributes are matched to the existing ones by label, and the identifier is carried over — which matters more than it looks, because every term's stored values are filed under it. Re-minting one leaves each existing term's value orphaned under a key nothing names any more. Verified live: widening a single-select's options and adding a new attribute left an existing term reading all of its values.
+  - **The identifiers are generated here because the API will not.** Omitting them fails with `The value for field "name" must be unique`, which names neither the attribute nor the real problem.
+  - Attributes the caller does not mention survive an update; `remove_attributes` drops one by label. A `single-select` or `multi-select` declared with no `allowed_values` is refused, since nothing could ever be stored in it — the service accepts that definition happily. `label` defaults from `name`, which the API leaves empty rather than defaulting, showing as a blank in the UI.
+  - `delete_glossary_term_type` refuses while terms still use the type, naming how many and how to list them; `force` overrides.
 - **`get_glossary_term_type` now reports a `value_format` per attribute.** The glossary service publishes no OpenAPI document and several attribute types accept exactly one spelling, so the contract a caller needs was previously discoverable only by provoking a 400. Each attribute now states its accepted form alongside its type, required flag and allowed values.
 
 

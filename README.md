@@ -4,7 +4,7 @@ A Model Context Protocol (MCP) server for executing SAS code, training AutoML pr
 
 ## Features
 
-- 87 tools across 10 selectable tiers, spanning the Analytics Life Cycle on SAS Viya
+- 90 tools across 10 selectable tiers, spanning the Analytics Life Cycle on SAS Viya
 - Prompt Templates for improving your SAS Code
 - OAuth2 authentication with PKCE flow
 - HTTP-based MCP server compatible with MCP clients
@@ -165,7 +165,7 @@ MCP_TIERS=0-3 uv run app
 
 ### Read-only mode
 
-Set `MCP_READ_ONLY=true` to expose only tools that neither change server-side state nor cause server-side work — 50 of the 87 tools. Withheld tools are never registered, so they are absent from the client's tool list entirely: the model cannot see them, so it cannot attempt them.
+Set `MCP_READ_ONLY=true` to expose only tools that neither change server-side state nor cause server-side work — 50 of the 90 tools. Withheld tools are never registered, so they are absent from the client's tool list entirely: the model cannot see them, so it cannot attempt them.
 
 This is a filter over the tiers, not a tier of its own — the read/write split cuts across every tier (Tier 3 has both `get_report` and `delete_report`). The two settings compose:
 
@@ -310,7 +310,7 @@ Two things about the glossary are worth knowing before you start, because both a
 - **search_glossary_terms**: Free-text, ranked search over term names and definitions — the way in when you know a word rather than an id. Reports `assigned_asset_count`, so you can see whether a term is actually in use
 - **list_glossary_terms**: Exact structural listing — by term type, by parent (the authoritative hierarchy), or by name fragment
 - **get_glossary_term**: One term in full, with its custom attributes named rather than hashed
-- **list_glossary_term_types** / **get_glossary_term_type**: The term types available, and the attribute contract a term of that type must satisfy — call the latter before authoring
+- **list_glossary_term_types** / **get_glossary_term_type**: The term types available, and the attribute contract a term of that type must satisfy — call the latter before authoring. Each attribute reports the one value format Viya accepts for it, which the API itself documents nowhere
 
 *Where terms meet data:*
 - **list_term_assets**: The columns a term is attached to, with their tables. The authoritative answer to "where is this term used?"
@@ -321,6 +321,9 @@ Two things about the glossary are worth knowing before you start, because both a
 - **update_glossary_term**: Change a term's text or attributes. Merges onto the current term, so omitted fields are left alone rather than blanked
 - **delete_glossary_term**: Permanently delete a term and every assignment that referenced it
 - **assign_glossary_term** / **unassign_glossary_term**: Attach a term to a table column, or detach it. This is the step that makes a term govern data — a term with no assigned assets governs nothing
+
+*Designing the vocabulary:*
+- **create_glossary_term_type** / **update_glossary_term_type** / **delete_glossary_term_type**: Define the template terms are created from — which custom attributes they carry, which are mandatory, and what values each accepts. An edit matches attributes by label and keeps each one's identifier, so terms already carrying a value do not lose it; delete refuses while terms still use the type
 
 Terms assigned this way also become searchable through Tier 1's **catalog_search** using the `Column.term:"<term name>"` facet on the `datasets` index, which returns the tables carrying a term without resolving individual columns.
 
@@ -545,7 +548,7 @@ tsv, and `file_path`/`data_format` coverage needs no extra deps. Generating a
 `sas7bdat`/`sashdat` fixture requires SAS itself, so those two formats are covered by
 unit-level payload tests only, not live.
 
-Every one of the 87 tools and 9 prompt templates has an integration test, enforced by the
+Every one of the 90 tools and 9 prompt templates has an integration test, enforced by the
 `test_every_tool_has_integration_coverage` / `test_every_prompt_has_integration_coverage`
 guards — adding a new tool or prompt without integration coverage fails the suite. The
 resource-dependent tests discover real targets on the instance: `score_data` scores the most

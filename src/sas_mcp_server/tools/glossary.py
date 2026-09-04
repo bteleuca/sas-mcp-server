@@ -44,6 +44,7 @@ from ..config import VIYA_ENDPOINT
 from ..helpers.glossary_helpers import (
     WIRE_FORMATS,
     attribute_maps,
+    build_attribute_definitions,
     chunk_ids,
     encode_attributes,
     glossary_id_from_resource,
@@ -60,11 +61,14 @@ from ..viya_client import (
     put_json,
     raise_for_viya_status,
 )
-from ._common import coerce_json_dict, make_session_helpers
+from ._common import coerce_json_dict, coerce_json_list, make_session_helpers
 
 # Tolerant alias for the attributes map, which some MCP clients deliver as a
 # JSON-encoded string (see _common.coerce_json_dict). The schema is unchanged.
 AttributeMap = Annotated[dict[str, Any], BeforeValidator(coerce_json_dict)]
+# Same tolerance for the two list-shaped arguments the term-type tools take.
+AttributeSpecList = Annotated[list[dict[str, Any]], BeforeValidator(coerce_json_list)]
+StringList = Annotated[list[str], BeforeValidator(coerce_json_list)]
 
 _GLOSSARY = "/glossary"
 _CATALOG = "/catalog"
@@ -438,6 +442,184 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "usage_count": term_type.get("usageCount", 0),
                 "allow_custom_attributes": term_type.get("allowCustomAttributes", False),
                 "attributes": attributes,
+            }
+
+    # --- term type authoring -------------------------------------------------
+
+    def term_type_summary(term_type: JSONDict) -> dict[str, Any]:
+        """The shape every term-type tool returns, so they read alike."""
+        return {
+            "term_type_id": term_type.get("id"),
+            "name": term_type.get("name"),
+            "label": term_type.get("label"),
+            "description": term_type.get("description", ""),
+            "usage_count": term_type.get("usageCount", 0),
+            "allow_custom_attributes": term_type.get("allowCustomAttributes", False),
+            "attributes": [
+                {
+                    "label": definition.get("label"),
+                    "type": definition.get("type"),
+                    "required": bool(definition.get("required", False)),
+                    "allowed_values": definition.get("items", []),
+                    "default": definition.get("defaultValue", ""),
+                    "attribute_id": definition.get("name"),
+                    "value_format": WIRE_FORMATS.get(
+                        (definition.get("type") or "").lower(), "a string"
+                    ),
+                }
+                for definition in term_type.get("attributes", []) or []
+            ],
+        }
+
+    @mcp.tool()
+    async def create_glossary_term_type(
+        name: str,
+        ctx: Context,
+        label: str | None = None,
+        description: str | None = None,
+        attributes: AttributeSpecList | None = None,
+        allow_custom_attributes: bool = False,
+    ) -> dict[str, Any]:
+        """Create a term type — the template that fixes what a term must carry.
+
+        A term type declares the custom attributes every term of that type
+        holds, and which are mandatory. Without this tool a deployment's types
+        can only be created in the SAS UI, so a glossary could be read and
+        populated through MCP but never *designed* through it.
+
+        Each attribute is ``{"label": ..., "type": ...}`` plus, optionally,
+        ``required``, ``allowed_values``, ``default`` and ``description``:
+
+        * ``single-line``, ``multi-line`` — free text
+        * ``single-select``, ``multi-select`` — need ``allowed_values``
+        * ``boolean``, ``date``, ``date-time``, ``time``
+
+        The attribute identifiers the API demands are generated here, since it
+        will not mint them itself and rejects the omission with a message that
+        names neither the attribute nor the real problem.
+
+        Args:
+            name: Term type name, unique across the deployment.
+            label: Display name. Defaults to *name* — the API leaves it empty
+                rather than defaulting it, which shows as a blank in the UI.
+            description: What terms of this type are for.
+            attributes: The attribute definitions, e.g.
+                ``[{"label": "Scope", "type": "single-select",
+                "allowed_values": ["Local", "Group"], "required": true}]``.
+            allow_custom_attributes: Let individual terms add attributes beyond
+                these (default false).
+        """
+        async with viya_session("create_glossary_term_type", ctx) as client:
+            body: dict[str, Any] = {
+                "name": name,
+                "label": label or name,
+                "allowCustomAttributes": allow_custom_attributes,
+                "attributes": build_attribute_definitions(attributes),
+            }
+            if description is not None:
+                body["description"] = description
+            created = await post_json(
+                f"{_GLOSSARY}/termTypes",
+                client,
+                body,
+                accept=_TERM_TYPE_MEDIA,
+            )
+            return term_type_summary(created)
+
+    @mcp.tool()
+    async def update_glossary_term_type(
+        term_type_id: str,
+        ctx: Context,
+        name: str | None = None,
+        label: str | None = None,
+        description: str | None = None,
+        attributes: AttributeSpecList | None = None,
+        remove_attributes: StringList | None = None,
+        allow_custom_attributes: bool | None = None,
+    ) -> dict[str, Any]:
+        """Change a term type: rename it, or add, edit and remove its attributes.
+
+        Attributes are matched to the existing ones **by label**, and an edit
+        keeps that attribute's identifier — which matters more than it looks,
+        because every term's stored values are filed under it. An attribute the
+        caller does not mention is left alone; a label that does not exist yet
+        is added.
+
+        Making an attribute ``required`` applies to terms created *afterwards*
+        and to every later edit of the ones already there: an update rewrites
+        the whole term, so older terms must be given a value for it before they
+        can be saved again. ``update_glossary_term`` reports that by name.
+
+        Args:
+            term_type_id: The term type UUID, or its name.
+            name: New name.
+            label: New display name.
+            description: New description.
+            attributes: Attributes to add or change, same shape as
+                ``create_glossary_term_type``. Omitted attributes survive.
+            remove_attributes: Labels to drop from the type. Terms keep the
+                stored value, but under an identifier nothing names any more, so
+                it stops being readable as that attribute.
+            allow_custom_attributes: Whether terms may add their own.
+        """
+        async with viya_session("update_glossary_term_type", ctx) as client:
+            resolved = await resolve_term_type_id(client, term_type_id)
+            current = await fetch_term_type(client, resolved)
+            body = {key: value for key, value in current.items() if key != "links"}
+            if name is not None:
+                body["name"] = name
+            if label is not None:
+                body["label"] = label
+            if description is not None:
+                body["description"] = description
+            if allow_custom_attributes is not None:
+                body["allowCustomAttributes"] = allow_custom_attributes
+            body["attributes"] = build_attribute_definitions(
+                attributes,
+                current.get("attributes", []) or [],
+                remove=remove_attributes,
+            )
+            updated = await put_json(
+                f"{_GLOSSARY}/termTypes/{resolved}",
+                client,
+                body,
+                content_type=_TERM_TYPE_MEDIA,
+                accept=_TERM_TYPE_MEDIA,
+            )
+            return term_type_summary(updated or current)
+
+    @mcp.tool()
+    async def delete_glossary_term_type(
+        term_type_id: str, ctx: Context, force: bool = False
+    ) -> dict[str, Any]:
+        """Delete a term type.
+
+        Refuses while terms still use the type, because deleting it takes their
+        attribute definitions with it. Check with ``list_glossary_terms``
+        (``term_type=``) and move or delete those terms first — or pass
+        ``force`` if you have already decided.
+
+        Args:
+            term_type_id: The term type UUID, or its name.
+            force: Delete even though terms use this type (default false).
+        """
+        async with viya_session("delete_glossary_term_type", ctx) as client:
+            resolved = await resolve_term_type_id(client, term_type_id)
+            current = await fetch_term_type(client, resolved)
+            in_use = current.get("usageCount", 0) or 0
+            if in_use and not force:
+                raise ValueError(
+                    f"term type '{current.get('name')}' is used by {in_use} term(s), whose "
+                    "attribute definitions go with it. List them with "
+                    f"list_glossary_terms(term_type='{resolved}'), then delete or retype "
+                    "them — or pass force=true to delete the type anyway."
+                )
+            await delete_resource(f"{_GLOSSARY}/termTypes/{resolved}", client)
+            return {
+                "status": "deleted",
+                "term_type_id": resolved,
+                "name": current.get("name"),
+                "terms_affected": in_use,
             }
 
     # --- finding terms -------------------------------------------------------
