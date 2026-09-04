@@ -86,6 +86,11 @@ _TERM_ASSET_DEFINITION = "glossaryTermAsset"
 _TERMS_INDEX = "terms"
 _DATASETS_INDEX = "datasets"
 
+# Ceiling on the relationships one call may read. ``list_term_assets`` takes a
+# ``limit`` and this bounds it, the way fedsql_registry.MAX_LIMIT bounds
+# ``query_data``'s.
+_RELATIONSHIP_PAGE = 500
+
 
 def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> None:
     """Register Tier 9 (Business Glossary) tools on *mcp*."""
@@ -95,22 +100,32 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
     # --- shared lookups ------------------------------------------------------
 
     async def instance_collection(
-        client: httpx.AsyncClient, filter_expr: str, limit: int, item_media: str
-    ) -> list[JSONDict]:
+        client: httpx.AsyncClient,
+        filter_expr: str,
+        limit: int,
+        item_media: str,
+        start: int = 0,
+    ) -> tuple[list[JSONDict], int]:
         """GET a ``/catalog/instances`` collection with an explicit ``Accept-Item``.
 
         ``Accept-Item`` is what decides whether items come back complete or as
         summaries with ``resourceId`` and the relationship endpoints stripped.
         :func:`get_json` has no parameter for it, so this issues the request
         directly rather than widening a helper every other tier depends on.
+
+        Returns ``(items, total)``, where *total* is the collection's own
+        ``count`` — how many match the filter, not how many this page holds. A
+        caller paging through needs that to know whether it has seen them all.
         """
         resp = await client.get(
             f"{VIYA_ENDPOINT}{_CATALOG}/instances",
             headers={"Accept": _COLLECTION_MEDIA, "Accept-Item": item_media},
-            params={"filter": filter_expr, "start": 0, "limit": limit},
+            params={"filter": filter_expr, "start": start, "limit": limit},
         )
         raise_for_viya_status(resp)
-        return resp.json().get("items", []) or []
+        body = resp.json()
+        items = body.get("items", []) or []
+        return items, body.get("count", len(items))
 
     async def fetch_term_type(client: httpx.AsyncClient, term_type_id: str) -> JSONDict:
         if not term_type_id:
@@ -161,9 +176,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         """Batch-resolve catalog entity ids to their full entity representations."""
         found: dict[str, JSONDict] = {}
         for chunk in chunk_ids(sorted({i for i in ids if i})):
-            for item in await instance_collection(
+            page, _ = await instance_collection(
                 client, in_filter("id", chunk), len(chunk) + 10, _ENTITY_MEDIA
-            ):
+            )
+            for item in page:
                 found[item["id"]] = item
         return found
 
@@ -174,38 +190,62 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         found: dict[str, JSONDict] = {}
         for chunk in chunk_ids(sorted({i for i in glossary_ids if i})):
             resources = [f"/glossary/terms/{gid}" for gid in chunk]
-            for item in await instance_collection(
+            page, _ = await instance_collection(
                 client, in_filter("resourceId", resources), len(chunk) + 10, _ENTITY_MEDIA
-            ):
+            )
+            for item in page:
                 gid = glossary_id_from_resource(item.get("resourceId"))
                 if gid:
                     found[gid] = item
         return found
 
     async def term_asset_relationships(
-        client: httpx.AsyncClient, entity_ids: list[str]
-    ) -> list[JSONDict]:
+        client: httpx.AsyncClient,
+        entity_ids: list[str],
+        limit: int = _RELATIONSHIP_PAGE,
+        start: int = 0,
+    ) -> tuple[list[JSONDict], int]:
         """Every ``glossaryTermAsset`` relationship touching any of *entity_ids*.
 
         One filtered call per chunk, endpoints included. The naive shape — filter
         for ids, then GET each relationship to read its endpoints — costs a round
         trip per link for the same answer.
+
+        Returns ``(relationships, total)``, *total* being how many exist rather
+        than how many this page holds, so a caller can page to the end.
+
+        *start* offsets within a single chunk and is meaningful only for a
+        one-entity lookup (``list_term_assets``). Paging across chunks would need
+        a cursor per chunk; the multi-entity caller (``list_table_terms``) pages
+        by column instead and always passes 0.
         """
+        page = max(1, min(limit, _RELATIONSHIP_PAGE))
+        chunks = chunk_ids(sorted({i for i in entity_ids if i}))
+        if start and len(chunks) > 1:
+            raise ValueError(
+                "start is only supported for a single-entity lookup; this call spans "
+                f"{len(chunks)} batches."
+            )
         rels: list[JSONDict] = []
-        for chunk in chunk_ids(sorted({i for i in entity_ids if i})):
+        total = 0
+        for chunk in chunks:
             expr = (
                 f"and(eq(definition,'{_TERM_ASSET_DEFINITION}'),"
                 f"or({in_filter('endpoint1Id', chunk)},{in_filter('endpoint2Id', chunk)}))"
             )
-            rels.extend(await instance_collection(client, expr, 500, _RELATIONSHIP_MEDIA))
-        return rels
+            found, matched = await instance_collection(
+                client, expr, page, _RELATIONSHIP_MEDIA, start
+            )
+            rels.extend(found)
+            total += matched
+        return rels, total
 
     async def table_entity(
         client: httpx.AsyncClient, resource_uri: str | None, table_name: str | None
     ) -> JSONDict:
         """Resolve a table to its catalog entity, by resource URI or by name."""
         if resource_uri:
-            items = await instance_collection(
+            items, _ = await instance_collection(
                 client, f"eq(resourceId,'{filter_literal(resource_uri)}')", 2, _ENTITY_MEDIA
             )
             if not items:
@@ -247,12 +287,13 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         client: httpx.AsyncClient, table_resource: str, limit: int
     ) -> list[JSONDict]:
         """The column entities of a table, keyed off its resource URI."""
-        return await instance_collection(
+        columns, _ = await instance_collection(
             client,
             f"startsWith(resourceId,'{filter_literal(table_resource)}/columns/')",
             limit,
             _ENTITY_MEDIA,
         )
+        return columns
 
     async def resolve_term(
         client: httpx.AsyncClient, term_id: str | None, term_name: str | None
@@ -557,7 +598,11 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
 
     @mcp.tool()
     async def list_term_assets(
-        ctx: Context, term_id: str | None = None, term_name: str | None = None
+        ctx: Context,
+        term_id: str | None = None,
+        term_name: str | None = None,
+        limit: int = 100,
+        start: int = 0,
     ) -> dict[str, Any]:
         """List the data assets a business term is attached to — the columns that mean it.
 
@@ -575,6 +620,12 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             term_id: The glossary term UUID.
             term_name: Exact term name, if the id is not known. One of the two is
                 required.
+            limit: Maximum assets to return in one call (default 100, ceiling
+                500 — the catalog's page size).
+            start: Offset of the first asset returned (default 0). ``count`` in
+                the result is the term's **total** asset count, so to read every
+                asset of a heavily used term, call again with
+                ``start`` = ``next_start`` until ``truncated`` is false.
         """
         async with viya_session("list_term_assets", ctx) as client:
             glossary_id, term = await resolve_term(client, term_id, term_name)
@@ -592,7 +643,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                     ),
                 }
             entity_id = entity["id"]
-            rels = await term_asset_relationships(client, [entity_id])
+            rels, total = await term_asset_relationships(client, [entity_id], limit, start)
             asset_ids = [
                 rel.get("endpoint2Id") if rel.get("endpoint1Id") == entity_id else rel.get("endpoint1Id")
                 for rel in rels
@@ -616,13 +667,25 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                         "table_name": table_resource.rsplit("/", 1)[-1] if table_resource else "",
                     }
                 )
-            return {
+            seen = start + len(resolved)
+            truncated = seen < total
+            result: dict[str, Any] = {
                 "term_id": glossary_id,
                 "catalog_entity_id": entity_id,
                 "name": term.get("name"),
+                "count": total,
+                "start": start,
                 "asset_count": len(resolved),
                 "assets": resolved,
+                "truncated": truncated,
             }
+            if truncated:
+                result["next_start"] = seen
+                result["note"] = (
+                    f"Showing {len(resolved)} of {total} assets. Call again with "
+                    f"start={seen} for the next page."
+                )
+            return result
 
     @mcp.tool()
     async def list_table_terms(
@@ -657,7 +720,7 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             table_resource = table.get("resourceId", "")
             columns = await column_entities(client, table_resource, max_columns)
             by_entity = {column["id"]: column for column in columns if column.get("id")}
-            rels = await term_asset_relationships(client, list(by_entity))
+            rels, _ = await term_asset_relationships(client, list(by_entity))
 
             term_entity_ids = [
                 rel.get("endpoint1Id") if rel.get("endpoint2Id") in by_entity else rel.get("endpoint2Id")
@@ -899,7 +962,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             table = await table_entity(client, resource_uri, table_name)
             column = await column_for(client, table, column_name)
 
-            for rel in await term_asset_relationships(client, [column["id"]]):
+            column_rels, _ = await term_asset_relationships(client, [column["id"]])
+            for rel in column_rels:
                 if term_entity["id"] in (rel.get("endpoint1Id"), rel.get("endpoint2Id")):
                     return {
                         "status": "already_assigned",
@@ -970,7 +1034,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             }
             if term_entity is None:
                 return not_assigned
-            for rel in await term_asset_relationships(client, [column["id"]]):
+            column_rels, _ = await term_asset_relationships(client, [column["id"]])
+            for rel in column_rels:
                 if term_entity["id"] in (rel.get("endpoint1Id"), rel.get("endpoint2Id")):
                     await delete_resource(f"{_CATALOG}/instances/{rel['id']}", client)
                     return {

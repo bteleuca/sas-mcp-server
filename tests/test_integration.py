@@ -1832,7 +1832,7 @@ async def _wait_for_catalog_entity(client, term_id: str, attempts: int = 12) -> 
     """
     for _ in range(attempts):
         assets = (await client.call_tool("list_term_assets", {"term_id": term_id})).data
-        if not assets.get("note"):
+        if assets.get("catalog_entity_id"):
             return True
         await asyncio.sleep(5)
     return False

@@ -165,7 +165,13 @@ class FakeViya:
             # else gets the stripped summary a real server returns.
             if "relationship+json" not in item_media:
                 hits = [{k: v for k, v in h.items() if not k.startswith("endpoint")} for h in hits]
-            return self._json({"items": hits, "count": len(hits)})
+            # A real collection honours start/limit and reports the unpaged
+            # total as ``count``; the tier pages on exactly that, so the fake
+            # has to behave the same or the paging tests prove nothing.
+            total = len(hits)
+            offset = int(request.url.params.get("start", 0))
+            hits = hits[offset : offset + int(request.url.params.get("limit", 100))]
+            return self._json({"items": hits, "count": total})
 
         matched: list[dict[str, Any]] = []
         if expr.startswith("in(id,"):
@@ -541,6 +547,71 @@ async def test_relationship_lookup_requests_the_endpoints():
     ]
     assert rel_calls
     assert all(r.headers["Accept-Item"] == glossary._RELATIONSHIP_MEDIA for r in rel_calls)
+
+
+def _many_assets(count: int) -> list[dict[str, Any]]:
+    """*count* relationships hanging off the same term, one per column."""
+    return [
+        {**RELATIONSHIP, "id": f"rel-{n}", "endpoint2Id": f"cent-col-{n}"} for n in range(count)
+    ]
+
+
+async def test_list_term_assets_reports_the_total_not_just_the_page():
+    """A partial list must not read as the whole story: count is the term's total."""
+    fake = FakeViya()
+    fake.relationships = _many_assets(5)
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool("list_term_assets", {"term_id": TERM_ID, "limit": 2})
+        )
+    assert result["asset_count"] == 2
+    assert result["count"] == 5
+    assert result["truncated"] is True
+    assert result["next_start"] == 2
+    assert "2 of 5" in result["note"]
+    rel_calls = [r for r in fake.requests if "glossaryTermAsset" in r.url.params.get("filter", "")]
+    assert rel_calls[0].url.params["limit"] == "2"
+
+
+async def test_paging_with_start_reaches_every_asset():
+    """The answer to 'I want them all': page on next_start until truncated is false."""
+    fake = FakeViya()
+    fake.relationships = _many_assets(7)
+    seen: list[str] = []
+    start, pages = 0, 0
+    async with glossary_client(fake) as client:
+        while True:
+            page = result_of(
+                await client.call_tool(
+                    "list_term_assets", {"term_id": TERM_ID, "limit": 3, "start": start}
+                )
+            )
+            seen.extend(a["asset_id"] for a in page["assets"])
+            pages += 1
+            if not page["truncated"]:
+                break
+            start = page["next_start"]
+    assert pages == 3
+    assert len(seen) == 7
+    assert len(set(seen)) == 7, "pages must not overlap"
+
+
+async def test_list_term_assets_is_not_flagged_truncated_when_it_is_complete():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(await client.call_tool("list_term_assets", {"term_id": TERM_ID}))
+    assert result["truncated"] is False
+    assert result["count"] == result["asset_count"] == 1
+    assert "note" not in result and "next_start" not in result
+
+
+async def test_list_term_assets_limit_cannot_exceed_the_ceiling():
+    """The ceiling is the catalog's page size, not a suggestion."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool("list_term_assets", {"term_id": TERM_ID, "limit": 100_000})
+    rel_calls = [r for r in fake.requests if "glossaryTermAsset" in r.url.params.get("filter", "")]
+    assert rel_calls[0].url.params["limit"] == str(glossary._RELATIONSHIP_PAGE)
 
 
 async def test_list_term_assets_reports_a_term_with_no_catalog_entity():

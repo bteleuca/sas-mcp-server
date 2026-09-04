@@ -29,6 +29,13 @@ JSONDict = dict[str, Any]
 
 # Viya filters travel in the query string, so a few hundred UUIDs would build a
 # URL the gateway rejects. Batched id lookups are chunked to stay inside that.
+#
+# Deliberately not a tool argument, unlike the ``limit`` the list tools take.
+# Those change *what the caller gets back*; this only changes how many requests
+# it takes to fetch the same answer — chunking 100 ids as 40+40+20 or as 100
+# returns identical results. So there is no value a caller could pick that
+# improves the answer, and a large one silently reintroduces the rejected-URL
+# failure it exists to prevent. Tune it here, where the reason lives.
 ID_CHUNK = 40
 
 _TERM_RESOURCE_RE = re.compile(r"/glossary/terms/([^/]+)$")
