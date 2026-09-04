@@ -308,7 +308,7 @@ Two things about the glossary are worth knowing before you start, because both a
 
 *Dictionary:*
 - **search_glossary_terms**: Free-text, ranked search over term names and definitions — the way in when you know a word rather than an id. Reports `assigned_asset_count`, so you can see whether a term is actually in use
-- **list_glossary_terms**: Exact structural listing — by term type, by parent (the authoritative hierarchy), or by name fragment
+- **list_glossary_terms**: Exact structural listing — by term type, by parent (the authoritative hierarchy), or by name fragment. `include_attributes` returns each term's attribute values (free — the listing already carries them), and `attribute_filter` keeps only the terms matching, e.g. `{"Used in Risk": true}`. The glossary cannot filter on attributes server-side, so that filter is applied here and the result reports how much of the dictionary it scanned
 - **get_glossary_term**: One term in full, with its custom attributes named rather than hashed
 - **list_glossary_term_types** / **get_glossary_term_type**: The term types available, and the attribute contract a term of that type must satisfy — call the latter before authoring. Each attribute reports the one value format Viya accepts for it, which the API itself documents nowhere
 

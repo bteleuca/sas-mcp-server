@@ -1265,3 +1265,122 @@ async def test_delete_term_type_proceeds_with_force():
     assert result["status"] == "deleted"
     assert result["terms_affected"] == 3
     assert fake.deleted == [f"/glossary/termTypes/{TERM_TYPE_ID}"]
+
+
+# --- attributes in list and search --------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stored", "wanted", "expected"),
+    [
+        (True, True, True),
+        (True, "true", True),
+        (False, True, False),
+        ("Gold", "gold", True),  # values are read off a screen, not identifiers
+        ("Gold", "Silver", False),
+        (["EMEA", "APAC"], "EMEA", True),  # a multi-select matches on contains
+        (["EMEA", "APAC"], ["EMEA", "APAC"], True),
+        (["EMEA"], ["EMEA", "APAC"], False),
+        (["EMEA"], "AMER", False),
+    ],
+)
+def test_attribute_match_semantics(stored, wanted, expected):
+    assert gh.attribute_matches(stored, wanted) is expected
+
+
+def test_filter_clauses_are_anded_and_a_missing_attribute_never_matches():
+    readable = {"Tier": "Gold", "Masked": True}
+    assert gh.matches_attribute_filter(readable, {"Tier": "Gold", "Masked": True})
+    assert not gh.matches_attribute_filter(readable, {"Tier": "Gold", "Masked": False})
+    assert not gh.matches_attribute_filter(readable, {"Absent": "x"})
+
+
+async def test_list_can_return_attributes_without_extra_calls_per_term():
+    """The listing already carries the raw map; only the term type is fetched."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool("list_glossary_terms", {"include_attributes": True})
+        )
+    assert result["items"][0]["attributes"] == {
+        "Scope": "Group",
+        "Used in Risk": True,
+        "Regions": ["EMEA", "APAC"],
+    }
+    term_list_calls = [
+        r for r in fake.requests if r.url.path == "/glossary/terms" and r.method == "GET"
+    ]
+    assert len(term_list_calls) == 1, "attributes must not cost a call per term"
+
+
+async def test_list_omits_attributes_by_default():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(await client.call_tool("list_glossary_terms", {}))
+    assert "attributes" not in result["items"][0]
+
+
+async def test_attribute_filter_keeps_only_matching_terms_and_reports_the_scan():
+    """Filtering is client-side, so the answer must say how much it covered."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        hit = result_of(
+            await client.call_tool(
+                "list_glossary_terms", {"attribute_filter": {"Used in Risk": True}}
+            )
+        )
+        miss = result_of(
+            await client.call_tool(
+                "list_glossary_terms", {"attribute_filter": {"Used in Risk": False}}
+            )
+        )
+    assert hit["count"] == 1
+    assert hit["items"][0]["attributes"]["Used in Risk"] is True
+    assert hit["scanned"] == 1
+    assert hit["scan_complete"] is True
+    assert miss["count"] == 0
+
+
+async def test_attribute_filter_matches_a_multi_select_on_contains():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "list_glossary_terms", {"attribute_filter": {"Regions": "APAC"}}
+            )
+        )
+    assert result["count"] == 1
+
+
+async def test_a_mistyped_filter_label_is_refused_rather_than_matching_nothing():
+    """An empty list would read as a real answer, which is the worst outcome."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception) as excinfo:
+            await client.call_tool(
+                "list_glossary_terms", {"attribute_filter": {"Used in Rsk": True}}
+            )
+    message = str(excinfo.value)
+    assert "Used in Rsk" in message
+    assert "used in risk" in message.lower(), "the valid labels must be listed"
+
+
+async def test_search_can_attach_attributes_and_batches_the_lookup():
+    fake = FakeViya()
+    fake.overrides["search"] = {
+        "items": [{"id": TERM_ENTITY_ID, "name": "Currency", "attributes": {}}],
+        "count": 1,
+    }
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "search_glossary_terms", {"query": "currency", "include_attributes": True}
+            )
+        )
+    assert result["items"][0]["attributes"]["Scope"] == "Group"
+    batched = [
+        r
+        for r in fake.requests
+        if r.url.path == "/glossary/terms" and "in(id," in r.url.params.get("filter", "")
+    ]
+    assert len(batched) == 1, "one batched lookup, not one call per hit"

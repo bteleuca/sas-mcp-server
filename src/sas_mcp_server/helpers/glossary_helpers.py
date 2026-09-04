@@ -478,16 +478,58 @@ def build_attribute_definitions(
     return built
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == "true"
+
+
+def attribute_matches(value: Any, wanted: Any) -> bool:
+    """Does one decoded attribute value satisfy one filter value?
+
+    A multi-select decodes to a list, where "contains" is the useful reading —
+    asking for ``{"Regions": "EMEA"}`` should find a term tagged EMEA *and*
+    APAC, not only one tagged EMEA alone. Passing a list asks for all of them.
+    Everything else compares as a string, case-insensitively, because the caller
+    is typing values they read off a screen.
+    """
+    if isinstance(value, list):
+        wanted_items = wanted if isinstance(wanted, (list, tuple, set)) else [wanted]
+        have = {str(item).strip().lower() for item in value}
+        return all(str(item).strip().lower() in have for item in wanted_items)
+    if isinstance(value, bool) or isinstance(wanted, bool):
+        return _as_bool(value) == _as_bool(wanted)
+    return str(value).strip().lower() == str(wanted).strip().lower()
+
+
+def matches_attribute_filter(readable: dict[str, Any], wanted: dict[str, Any]) -> bool:
+    """Does a term's label-keyed attributes satisfy every clause of *wanted*?
+
+    Clauses are ANDed, and a term missing the attribute never matches — an
+    absent value is not an empty one to compare against.
+    """
+    lowered = {str(label).strip().lower(): value for label, value in readable.items()}
+    for label, expected in wanted.items():
+        key = str(label).strip().lower()
+        if key not in lowered:
+            return False
+        if not attribute_matches(lowered[key], expected):
+            return False
+    return True
+
+
 __all__ = [
     "ATTRIBUTE_TYPES",
     "ID_CHUNK",
     "WIRE_FORMATS",
+    "attribute_matches",
     "attribute_maps",
     "build_attribute_definitions",
     "chunk_ids",
     "decode_attribute",
     "encode_attribute",
     "encode_attributes",
+    "matches_attribute_filter",
     "glossary_id_from_resource",
     "missing_required",
     "readable_attributes",

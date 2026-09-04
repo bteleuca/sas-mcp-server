@@ -48,6 +48,7 @@ from ..helpers.glossary_helpers import (
     chunk_ids,
     encode_attributes,
     glossary_id_from_resource,
+    matches_attribute_filter,
     missing_required,
     readable_attributes,
 )
@@ -91,6 +92,18 @@ _TERM_ASSET_DEFINITION = "glossaryTermAsset"
 # with "The indices \"term\" cannot be found."
 _TERMS_INDEX = "terms"
 _DATASETS_INDEX = "datasets"
+
+# The glossary cannot filter on an attribute value — every spelling of
+# ``eq(attributes.<uuid>,...)`` is rejected as an invalid filter — so
+# ``attribute_filter`` is applied here, over pages the server *can* return.
+# These bound that scan: enough to sweep a real dictionary (a live deployment
+# held 1,720 terms) without turning one call into an unbounded crawl.
+_SCAN_PAGE = 200
+_SCAN_CAP = 2000
+# How many valid labels to quote when rejecting a mistyped one. A glossary with
+# many term types has more than a caller can read; enough to spot the typo is
+# the useful amount.
+_LABELS_IN_ERROR = 40
 
 # Ceiling on the relationships one call may read. ``list_term_assets`` takes a
 # ``limit`` and this bounds it, the way fedsql_registry.MAX_LIMIT bounds
@@ -622,11 +635,64 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "terms_affected": in_use,
             }
 
+    # --- reading attributes off a list of terms -------------------------------
+
+    async def type_maps_for(
+        client: httpx.AsyncClient, type_id: str, cache: dict[str, dict[str, JSONDict]]
+    ) -> dict[str, JSONDict]:
+        """``uuid -> definition`` for one term type, fetched at most once."""
+        if type_id not in cache:
+            by_uuid, _ = attribute_maps(await fetch_term_type(client, type_id))
+            cache[type_id] = by_uuid
+        return cache[type_id]
+
+    async def decode_for_terms(
+        client: httpx.AsyncClient, raw_terms: list[JSONDict], cache: dict[str, dict[str, JSONDict]]
+    ) -> list[dict[str, Any]]:
+        """Label-keyed attributes for each term, in the order given.
+
+        The list representation already carries the raw ``attributes`` map, so
+        this costs one request per *distinct term type* on the page — normally
+        one — and none per term.
+        """
+        decoded = []
+        for term in raw_terms:
+            by_uuid = await type_maps_for(client, term.get("termTypeId", ""), cache)
+            decoded.append(readable_attributes(term.get("attributes"), by_uuid))
+        return decoded
+
+    async def known_attribute_labels(
+        client: httpx.AsyncClient, type_id: str | None = None
+    ) -> set[str]:
+        """Attribute labels in play, lowercased, for validating a filter.
+
+        Used to reject a mistyped filter label up front: filtering happens on
+        this side, so a typo would otherwise return an empty list that reads
+        like a real answer.
+
+        Scoped to one term type when the caller named one — otherwise every type
+        has to be read, which is a request each.
+        """
+        summaries = (
+            [{"id": type_id}] if type_id else await all_term_types(client)
+        )
+        labels: set[str] = set()
+        for summary in summaries:
+            definition = await fetch_term_type(client, summary.get("id", ""))
+            for attribute in definition.get("attributes", []) or []:
+                if attribute.get("label"):
+                    labels.add(attribute["label"].strip().lower())
+        return labels
+
     # --- finding terms -------------------------------------------------------
 
     @mcp.tool()
     async def search_glossary_terms(
-        query: str, ctx: Context, limit: int = 20, start: int = 0
+        query: str,
+        ctx: Context,
+        limit: int = 20,
+        start: int = 0,
+        include_attributes: bool = False,
     ) -> dict[str, Any]:
         """Free-text search of the business glossary — the way in when you know a word, not an id.
 
@@ -646,6 +712,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             query: Search text. ``*`` matches every term.
             limit: Maximum hits to return (default 20).
             start: Offset of the first hit (default 0).
+            include_attributes: Also return each hit's custom attributes, named
+                (default false). The search index does not carry them, so this
+                costs one extra batched call per 40 hits; leave it off when the
+                names and definitions are all you need.
         """
         async with viya_session("search_glossary_terms", ctx) as client:
             data = await get_json(
@@ -672,6 +742,34 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                         "score": hit.get("score"),
                     }
                 )
+            if include_attributes:
+                # The catalog index holds no custom attributes, so read them
+                # from the glossary itself — batched by id rather than one call
+                # per hit.
+                wanted = [item["term_id"] for item in items if item.get("term_id")]
+                by_id: dict[str, JSONDict] = {}
+                for chunk in chunk_ids(wanted):
+                    page = await get_json(
+                        f"{_GLOSSARY}/terms",
+                        client,
+                        params={
+                            "filter": in_filter("id", chunk),
+                            "start": 0,
+                            "limit": len(chunk),
+                        },
+                        accept=_COLLECTION_MEDIA,
+                    )
+                    for term in page.get("items", []) or []:
+                        by_id[term.get("id", "")] = term
+                cache: dict[str, dict[str, JSONDict]] = {}
+                for item in items:
+                    term = by_id.get(item.get("term_id") or "")
+                    if term is None:
+                        item["attributes"] = {}
+                        continue
+                    by_uuid = await type_maps_for(client, term.get("termTypeId", ""), cache)
+                    item["attributes"] = readable_attributes(term.get("attributes"), by_uuid)
+
             total = data.get("count", len(items))
             return {
                 "count": total,
@@ -697,6 +795,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         include_drafts: bool = False,
         limit: int = 20,
         start: int = 0,
+        include_attributes: bool = False,
+        attribute_filter: AttributeMap | None = None,
     ) -> dict[str, Any]:
         """List glossary terms by structure — term type, parent, or name fragment.
 
@@ -713,7 +813,31 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             include_drafts: Include unpublished drafts (default false — published only).
             limit: Maximum terms to return (default 20).
             start: Offset of the first term (default 0).
+            include_attributes: Also return each term's custom attributes,
+                named (default false). Free — the listing already carries them.
+            attribute_filter: Keep only terms whose attributes match, e.g.
+                ``{"Needs masking": true}`` or ``{"Regions": "EMEA"}``. Clauses
+                are ANDed; a multi-select matches when it *contains* the value.
+                **The glossary cannot filter on attributes server-side**, so
+                this is applied here over pages fetched for the purpose: the
+                result reports how many terms were scanned and whether the scan
+                reached the end. Narrow it with ``term_type`` or ``parent_id``
+                where you can.
         """
+        def project(item: JSONDict) -> dict[str, Any]:
+            return {
+                "term_id": item.get("id"),
+                "name": item.get("name"),
+                "term_type": item.get("termTypeLabel"),
+                "term_type_id": item.get("termTypeId"),
+                "definition": item.get("definition", ""),
+                "description": item.get("description", ""),
+                "parent_id": item.get("parentId"),
+                "status": item.get("status"),
+                "is_draft": item.get("isDraft", False),
+                "assigned_asset_count": item.get("assetCount", 0),
+            }
+
         async with viya_session("list_glossary_terms", ctx) as client:
             clauses = []
             if term_type:
@@ -724,32 +848,104 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             if name_contains:
                 clauses.append(f"contains(name,'{filter_literal(name_contains)}')")
             params: dict[str, Any] = {
-                "start": start,
-                "limit": limit,
                 "sortBy": "name:ascending",
                 "allowDrafts": "all" if include_drafts else "none",
             }
             if clauses:
                 params["filter"] = clauses[0] if len(clauses) == 1 else f"and({','.join(clauses)})"
-            data = await get_json(
-                f"{_GLOSSARY}/terms", client, params=params, accept=_COLLECTION_MEDIA
+
+            want_attributes = include_attributes or bool(attribute_filter)
+            cache: dict[str, dict[str, JSONDict]] = {}
+
+            if not attribute_filter:
+                data = await get_json(
+                    f"{_GLOSSARY}/terms",
+                    client,
+                    params={**params, "start": start, "limit": limit},
+                    accept=_COLLECTION_MEDIA,
+                )
+                raw = data.get("items", []) or []
+                items = [project(item) for item in raw]
+                if want_attributes:
+                    for item, decoded in zip(
+                        items, await decode_for_terms(client, raw, cache), strict=True
+                    ):
+                        item["attributes"] = decoded
+                return {"count": data.get("count", len(items)), "start": start, "items": items}
+
+            # Filtering happens here, so a mistyped label would quietly return
+            # nothing and read as a real answer. Reject it against the labels
+            # that actually exist first.
+            scope = await resolve_term_type_id(client, term_type) if term_type else None
+            known = await known_attribute_labels(client, scope)
+            unknown = sorted(
+                label
+                for label in attribute_filter
+                if str(label).strip().lower() not in known
             )
-            items = [
-                {
-                    "term_id": item.get("id"),
-                    "name": item.get("name"),
-                    "term_type": item.get("termTypeLabel"),
-                    "term_type_id": item.get("termTypeId"),
-                    "definition": item.get("definition", ""),
-                    "description": item.get("description", ""),
-                    "parent_id": item.get("parentId"),
-                    "status": item.get("status"),
-                    "is_draft": item.get("isDraft", False),
-                    "assigned_asset_count": item.get("assetCount", 0),
-                }
-                for item in data.get("items", []) or []
-            ]
-            return {"count": data.get("count", len(items)), "start": start, "items": items}
+            if unknown:
+                where = f"term type '{term_type}'" if scope else "any term type in this glossary"
+                # A glossary with many types has a long label list; enough of it
+                # to spot the typo is the useful amount, not all of it.
+                listed = sorted(known)
+                shown = listed[:_LABELS_IN_ERROR]
+                more = (
+                    f" (+{len(listed) - len(shown)} more)" if len(listed) > len(shown) else ""
+                )
+                raise ValueError(
+                    f"no attribute is named {unknown} on {where}. "
+                    f"Defined attribute labels: {shown}{more}. "
+                    "get_glossary_term_type lists them per type."
+                )
+
+            matched: list[dict[str, Any]] = []
+            scanned = 0
+            offset = start
+            scan_complete = False
+            while len(matched) < limit and scanned < _SCAN_CAP:
+                data = await get_json(
+                    f"{_GLOSSARY}/terms",
+                    client,
+                    params={**params, "start": offset, "limit": _SCAN_PAGE},
+                    accept=_COLLECTION_MEDIA,
+                )
+                raw = data.get("items", []) or []
+                if not raw:
+                    scan_complete = True
+                    break
+                decoded = await decode_for_terms(client, raw, cache)
+                for item, attributes in zip(raw, decoded, strict=True):
+                    if matches_attribute_filter(attributes, attribute_filter):
+                        hit = project(item)
+                        hit["attributes"] = attributes
+                        matched.append(hit)
+                        if len(matched) == limit:
+                            break
+                scanned += len(raw)
+                offset += len(raw)
+                if offset >= data.get("count", 0):
+                    scan_complete = True
+                    break
+
+            result: dict[str, Any] = {
+                "count": len(matched),
+                "start": start,
+                "items": matched,
+                # The glossary cannot filter on attributes, so these say how much
+                # of the dictionary this answer actually covers. Without them a
+                # short list is indistinguishable from a complete one.
+                "scanned": scanned,
+                "scan_complete": scan_complete,
+            }
+            if not scan_complete:
+                result["next_start"] = offset
+                result["note"] = (
+                    f"Matched {len(matched)} term(s) in the first {scanned} scanned. "
+                    "The glossary cannot filter on attribute values, so this scan is "
+                    f"capped: call again with start={offset} to continue, or narrow it "
+                    "with term_type or parent_id."
+                )
+            return result
 
     @mcp.tool()
     async def get_glossary_term(term_id: str, ctx: Context) -> dict[str, Any]:

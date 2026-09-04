@@ -2172,6 +2172,45 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
             assert updated["attributes"]["Tier"] == "Bronze"
             assert updated["attributes"]["Review date"] == "2027-01-31"
 
+            # Attributes in the listing, and the filter that needs them. Scoped
+            # to this type so the scan is deterministic and small.
+            listed = (
+                await client.call_tool(
+                    "list_glossary_terms",
+                    {"term_type": type_id, "limit": 10, "include_attributes": True},
+                )
+            ).data
+            assert listed["items"], "the term just created should be listed"
+            assert listed["items"][0]["attributes"]["Owner"] == "data-office"
+
+            # The glossary cannot filter on attributes, so this is scanned here
+            # — the result has to say so.
+            matched = (
+                await client.call_tool(
+                    "list_glossary_terms",
+                    {"term_type": type_id, "attribute_filter": {"Masked": True}},
+                )
+            ).data
+            assert matched["count"] == 1
+            assert matched["items"][0]["term_id"] == term_id
+            assert matched["scan_complete"] is True
+            assert matched["scanned"] >= 1
+
+            missed = (
+                await client.call_tool(
+                    "list_glossary_terms",
+                    {"term_type": type_id, "attribute_filter": {"Masked": False}},
+                )
+            ).data
+            assert missed["count"] == 0
+
+            # A mistyped label must not read as "nothing matched".
+            with pytest.raises(Exception, match="no attribute is named"):
+                await client.call_tool(
+                    "list_glossary_terms",
+                    {"term_type": type_id, "attribute_filter": {"Maskd": True}},
+                )
+
             dropped = (
                 await client.call_tool(
                     "update_glossary_term_type",
