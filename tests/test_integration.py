@@ -2430,6 +2430,40 @@ async def test_glossary_bulk_import(integration_mcp_server):
             # Required, but defaulted: no row supplied it and none was refused.
             assert by_name[f"{prefix} Mid"]["attributes"]["Stage"] == "draft"
 
+            # The import names no ids, so every row is matched back to its term
+            # by walking its path over one filtered lookup. Without this, using
+            # the imported terms means a search per term.
+            resolved = {t["name"]: t for t in result["terms"]}
+            assert set(resolved) == set(by_name)
+            for name, term in resolved.items():
+                assert term["term_id"] == by_name[name]["term_id"], name
+                assert term["existed"] is False, "the job just created it"
+            assert result["new"] == 3
+            assert result["already_existed"] == 0
+            assert resolved[f"{prefix} Leaf"]["path"] == f"{prefix} Root\\{prefix} Mid"
+
+            # Re-importing the same rows creates nothing, but the job still
+            # tallies them as successful — so 'new' is what says what happened.
+            again = (
+                await client.call_tool(
+                    "import_glossary_terms",
+                    {
+                        "term_type": type_id,
+                        "terms": [
+                            {"name": f"{prefix} Root", "attributes": {"Tier": "Gold"}},
+                            {"name": f"{prefix} Mid", "parent": f"{prefix} Root"},
+                        ],
+                    },
+                )
+            ).data
+            assert again["failures"] == []
+            assert again["new"] == 0, f"nothing was new: {again['terms']}"
+            assert again["already_existed"] == 2
+            assert {t["term_id"] for t in again["terms"]} == {
+                by_name[f"{prefix} Root"]["term_id"], by_name[f"{prefix} Mid"]["term_id"]
+            }, "the same terms, not duplicates"
+            assert "already existed" in again["note"]
+
             # A bad value is caught here, before anything is sent.
             with pytest.raises(Exception, match="only accepts"):
                 await client.call_tool(

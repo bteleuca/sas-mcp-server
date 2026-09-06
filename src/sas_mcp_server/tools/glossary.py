@@ -52,6 +52,8 @@ from ..helpers.glossary_helpers import (
     encode_attribute,
     encode_attributes,
     glossary_id_from_resource,
+    import_lookup_names,
+    match_imported_rows,
     matches_attribute_filter,
     missing_required,
     parse_import_log,
@@ -507,6 +509,82 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         except ValueError:
             return {}
         return {k: v for k, v in parsed.items() if isinstance(v, int)}
+
+    async def resolve_imported_terms(
+        client: httpx.AsyncClient, ordered: list[dict[str, Any]], job: JSONDict
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Find the term each imported row became, and whether it was new.
+
+        The import reports names and tallies and no ids at all, so anything a
+        caller wants to do next — assign an asset, re-parent, read the term back
+        — needs a lookup per row. This does it in one filtered request per 40
+        distinct names instead: sibling names are unique, so a ``(parentId,
+        name)`` index over the candidates rebuilds the hierarchy exactly and
+        every row's path walks straight down it.
+
+        The job's ``creationTimeStamp`` then separates a term the job created
+        from one that was already there, which the job itself does not — it
+        counts a row it skipped as successful just the same.
+
+        Returns the rows and a note, empty unless something could not be
+        resolved. A failure here is never fatal: the import has already
+        happened, and reporting it without ids beats losing the result.
+        """
+        names = import_lookup_names(ordered)
+        if not names:
+            return [], ""
+
+        candidates: list[JSONDict] = []
+        capped = False
+        for chunk in chunk_ids(names):
+            offset = 0
+            while True:
+                data = await get_json(
+                    f"{_GLOSSARY}/terms",
+                    client,
+                    params={
+                        "filter": in_filter("name", chunk),
+                        "start": offset,
+                        "limit": _SCAN_PAGE,
+                        # A row may have landed under a parent that is still a
+                        # draft, and an unresolved ancestor breaks the walk for
+                        # everything below it.
+                        "allowDrafts": "all",
+                    },
+                    accept=_COLLECTION_MEDIA,
+                )
+                page = data.get("items", []) or []
+                candidates.extend(page)
+                offset += len(page)
+                if not page or offset >= data.get("count", 0):
+                    break
+                if len(candidates) >= _SCAN_CAP:
+                    # A name common across a large glossary can match hundreds
+                    # of terms that have nothing to do with this batch. Stopping
+                    # loses ids rather than time, and the note says so.
+                    capped = True
+                    break
+            if capped:
+                break
+
+        terms = match_imported_rows(
+            ordered, candidates, started_at=str(job.get("creationTimeStamp") or "")
+        )
+        unresolved = [t["name"] for t in terms if not t["term_id"]]
+        if not unresolved:
+            return terms, ""
+        shown = unresolved[:_LABELS_IN_ERROR]
+        more = f" (+{len(unresolved) - len(shown)} more)" if len(unresolved) > len(shown) else ""
+        reason = (
+            f"the lookup stopped at {_SCAN_CAP} candidate terms"
+            if capped
+            else "they were not found under the path they were imported to"
+        )
+        return terms, (
+            f"No id could be resolved for {len(unresolved)} row(s) — {reason}. "
+            f"Unresolved: {shown}{more}. The import itself is unaffected; find those terms "
+            "with list_glossary_terms or search_glossary_terms."
+        )
 
     async def import_failures(client: httpx.AsyncClient, job: JSONDict) -> list[JSONDict]:
         """The per-row failures, read from the job's log.
@@ -1511,13 +1589,20 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         non-empty ``failures`` as a partial import: the successful rows are
         already committed.
 
+        **The result names the term each row became.** ``terms`` carries
+        ``{name, path, term_id, existed}`` per row, so the next step — assigning
+        an asset, re-parenting, reading one back — needs no lookup. This costs
+        one filtered request per 40 distinct names, not one per term.
+
         Two things the import does that a per-term create does not:
 
         * **A row is written whole.** With ``update_existing`` the term at that
           path is *replaced*, so an attribute the row omits is reset — not left
-          as it was. Without it the existing term is left alone, and the job
-          still counts the row as processed, so ``created`` counts rows the job
-          accepted rather than terms that are new.
+          as it was. Without it the existing term is left alone. Either way the
+          job counts the row as successful, so ``created`` counts rows the job
+          accepted; **``new`` is the count of terms that did not exist before**,
+          with ``already_existed`` the rest and ``existed`` saying which is
+          which per row.
         * **Omitted attributes take the term type's default**, on new rows as
           well as replaced ones — the same as creating a term through the API.
 
@@ -1630,6 +1715,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             counts = import_counts(job)
             failures = await import_failures(client, job)
             created = counts.get("successful", len(ordered) - len(failures))
+            terms, resolution_note = await resolve_imported_terms(client, ordered, job)
+            existed = [t for t in terms if t["existed"]]
             result: dict[str, Any] = {
                 "requested": len(ordered),
                 "created": created,
@@ -1641,14 +1728,32 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 # including one whose term already existed and was left alone.
                 # Anything else the job tallies is visible rather than dropped.
                 "counts": counts,
+                # What the job never reports: which term each row became, and
+                # which rows were not new. Without the ids, the next step —
+                # assigning an asset, re-parenting — needs a lookup per term.
+                "terms": terms,
+                "new": len(terms) - len(existed),
+                "already_existed": len(existed),
             }
+            notes = []
             if failures:
                 # The job's own state is "completed" even when every row failed,
                 # so saying this plainly is the only way a caller learns of it.
-                result["note"] = (
+                notes.append(
                     f"{created} of {len(ordered)} term(s) were created; the rest failed and "
                     "are listed in 'failures'. The successful ones are already committed."
                 )
+            if existed:
+                what = "replaced" if update_existing else "left untouched"
+                notes.append(
+                    f"{len(existed)} of {len(ordered)} row(s) named a term that already "
+                    f"existed at that path and were {what}. The import counts them as "
+                    "successful either way, so 'new' is the count that says what was created."
+                )
+            if resolution_note:
+                notes.append(resolution_note)
+            if notes:
+                result["note"] = " ".join(notes)
             return result
 
     @mcp.tool()

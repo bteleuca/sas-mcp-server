@@ -170,6 +170,10 @@ class FakeViya:
         # here because getting the path wrong is a 404 the tier has to avoid.
         self.term_is_draft = False
         self.publish_calls: list[dict[str, str]] = []
+        # What an `in(name, ...)` lookup finds. Empty by default, so a test that
+        # does not care about imported ids sees the unresolved path.
+        self.terms_by_name: list[dict[str, Any]] = []
+        self.job_started = "2026-09-06T10:00:00.000Z"
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
@@ -245,6 +249,14 @@ class FakeViya:
         if method == "GET" and path.startswith("/glossary/termTypes/"):
             return self._json(TERM_TYPE)
         if method == "GET" and path == "/glossary/terms":
+            expr = request.url.params.get("filter", "")
+            if expr.startswith("in(name,"):
+                # The post-import id resolution. Sibling names are unique, so
+                # the tier matches on (parentId, name) — the fake has to carry
+                # both, and the creation timestamps that say what was new.
+                wanted = {n.lower() for n in self._ids_in(expr, "name")}
+                hits = [t for t in self.terms_by_name if t["name"].lower() in wanted]
+                return self._json({"items": hits, "count": len(hits)})
             return self._json({"items": [self._term()], "count": 1})
 
         # --- the draft resource, which lives beside the term ------------------
@@ -282,6 +294,7 @@ class FakeViya:
                 {
                     "id": "job-1",
                     "state": "completed",
+                    "creationTimeStamp": self.job_started,
                     "results": {"counts": json.dumps(self.import_counts)},
                     "logLocation": "/files/files/log-1",
                 }
@@ -1646,6 +1659,68 @@ def test_csv_keeps_definition_and_description_in_their_own_columns():
     assert csv.splitlines()[1] == "A,T,,what it means,short overview"
 
 
+def test_lookup_names_cover_the_rows_and_every_path_level():
+    """A path may lead through terms that are not rows of this batch."""
+    ordered = gh.resolve_import_paths(
+        [{"name": "Leaf", "parent": "Existing\\Branch"}, {"name": "Root"}]
+    )
+    assert sorted(gh.import_lookup_names(ordered)) == ["Branch", "Existing", "Leaf", "Root"]
+
+
+def test_lookup_names_are_deduplicated_case_insensitively():
+    ordered = [{"name": "Risk", "_path": "Group\\risk"}, {"name": "Other", "_path": "GROUP"}]
+    assert sorted(n.lower() for n in gh.import_lookup_names(ordered)) == [
+        "group", "other", "risk"
+    ]
+
+
+def test_imported_rows_are_matched_by_walking_their_path():
+    """Sibling names are unique, so (parentId, name) identifies a term exactly."""
+    ordered = gh.resolve_import_paths(
+        [
+            {"name": "Leaf", "parent": "Mid"},
+            {"name": "Root"},
+            {"name": "Mid", "parent": "Root"},
+        ]
+    )
+    candidates = [
+        {"id": "r", "name": "Root", "parentId": None, "creationTimeStamp": "2026-09-06T11:00:00Z"},
+        {"id": "m", "name": "Mid", "parentId": "r", "creationTimeStamp": "2026-09-06T11:00:01Z"},
+        {"id": "l", "name": "Leaf", "parentId": "m", "creationTimeStamp": "2026-09-06T11:00:02Z"},
+        # The same name under a different parent must not be picked up.
+        {"id": "x", "name": "Leaf", "parentId": "other", "creationTimeStamp": "2020-01-01T00:00:00Z"},
+    ]
+    matched = gh.match_imported_rows(ordered, candidates, started_at="2026-09-06T10:00:00Z")
+    assert [(m["name"], m["term_id"]) for m in matched] == [
+        ("Root", "r"), ("Mid", "m"), ("Leaf", "l")
+    ]
+    assert not any(m["existed"] for m in matched), "all created after the job began"
+
+
+def test_a_term_older_than_the_job_is_reported_as_pre_existing():
+    """The job counts a row it skipped as successful; only the timestamp says otherwise."""
+    ordered = gh.resolve_import_paths([{"name": "Root"}, {"name": "Fresh", "parent": "Root"}])
+    candidates = [
+        {"id": "r", "name": "Root", "parentId": None, "creationTimeStamp": "2020-01-01T00:00:00Z"},
+        {"id": "f", "name": "Fresh", "parentId": "r", "creationTimeStamp": "2026-09-06T11:00:00Z"},
+    ]
+    matched = gh.match_imported_rows(ordered, candidates, started_at="2026-09-06T10:00:00Z")
+    assert {m["name"]: m["existed"] for m in matched} == {"Root": True, "Fresh": False}
+
+
+def test_an_unresolved_row_keeps_its_place_and_is_not_called_pre_existing():
+    """Dropping it would hide the gap; 'existed' on it would invent a fact."""
+    ordered = gh.resolve_import_paths([{"name": "Root"}, {"name": "Lost", "parent": "Nowhere"}])
+    candidates = [
+        {"id": "r", "name": "Root", "parentId": None, "creationTimeStamp": "2026-09-06T11:00:00Z"},
+    ]
+    matched = gh.match_imported_rows(ordered, candidates, started_at="2026-09-06T10:00:00Z")
+    lost = next(m for m in matched if m["name"] == "Lost")
+    assert lost["term_id"] is None
+    assert lost["existed"] is False
+    assert len(matched) == 2
+
+
 def test_import_log_is_parsed_into_rows():
     log = (
         "The term import process has completed.\n"
@@ -1757,6 +1832,92 @@ async def test_import_validates_attributes_before_sending_anything():
                 },
             )
     assert not [p for p in fake.posted if p["path"] == "/glossary/importTerms"]
+
+
+async def test_import_returns_the_id_of_each_term_it_created():
+    fake = FakeViya()
+    fake.import_counts = {"successful": 2, "errors": 0, "warnings": 0}
+    fake.terms_by_name = [
+        {"id": "t-root", "name": "Parent", "parentId": None,
+         "creationTimeStamp": "2026-09-06T10:00:05.000Z"},
+        {"id": "t-child", "name": "Child", "parentId": "t-root",
+         "creationTimeStamp": "2026-09-06T10:00:06.000Z"},
+    ]
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [
+                        {"name": "Child", "parent": "Parent", "attributes": {"Scope": "Local"}},
+                        {"name": "Parent", "attributes": {"Scope": "Group"}},
+                    ],
+                },
+            )
+        )
+    assert [(t["name"], t["term_id"]) for t in result["terms"]] == [
+        ("Parent", "t-root"), ("Child", "t-child")
+    ]
+    assert result["new"] == 2
+    assert result["already_existed"] == 0
+    # One filtered request for both names, not one per term.
+    lookups = [
+        r for r in fake.requests
+        if r.url.path == "/glossary/terms" and "in(name," in r.url.params.get("filter", "")
+    ]
+    assert len(lookups) == 1
+
+
+async def test_import_reports_a_row_whose_term_already_existed():
+    """The job counts it as successful, so 'created' alone reads as a fresh import."""
+    fake = FakeViya()
+    fake.import_counts = {"successful": 2, "errors": 0, "warnings": 2}
+    fake.terms_by_name = [
+        # Both predate the job: nothing was actually created.
+        {"id": "t-root", "name": "Parent", "parentId": None,
+         "creationTimeStamp": "2020-01-01T00:00:00.000Z"},
+        {"id": "t-child", "name": "Child", "parentId": "t-root",
+         "creationTimeStamp": "2020-01-01T00:00:01.000Z"},
+    ]
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [
+                        {"name": "Child", "parent": "Parent", "attributes": {"Scope": "Local"}},
+                        {"name": "Parent", "attributes": {"Scope": "Group"}},
+                    ],
+                },
+            )
+        )
+    assert result["created"] == 2, "the job's own tally is reported unchanged"
+    assert result["new"] == 0
+    assert result["already_existed"] == 2
+    assert all(t["existed"] for t in result["terms"])
+    assert "left untouched" in result["note"]
+
+
+async def test_import_says_so_when_an_id_could_not_be_resolved():
+    """The import already happened; losing the result over a failed lookup would be worse."""
+    fake = FakeViya()
+    fake.import_counts = {"successful": 1, "errors": 0, "warnings": 0}
+    fake.terms_by_name = []  # nothing comes back from the lookup
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [{"name": "Parent", "attributes": {"Scope": "Group"}}],
+                },
+            )
+        )
+    assert result["created"] == 1
+    assert result["terms"][0]["term_id"] is None
+    assert "No id could be resolved" in result["note"]
 
 
 async def test_import_refuses_a_row_missing_a_required_attribute():

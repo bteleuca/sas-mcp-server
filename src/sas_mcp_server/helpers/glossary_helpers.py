@@ -768,6 +768,87 @@ def build_term_csv(rows: list[dict[str, Any]], attribute_columns: list[str]) -> 
     return buffer.getvalue()
 
 
+def import_lookup_names(ordered: list[dict[str, Any]]) -> list[str]:
+    """Every term name needed to resolve an import's rows to their ids.
+
+    A row's own name, plus each level of its resolved ``_path`` — the levels
+    matter because a path may lead through terms that already existed and are
+    not rows of this batch, and the walk in :func:`match_imported_rows` starts
+    from the root.
+
+    De-duplicated case-insensitively but returned in their original spelling,
+    since the filter matches on the stored value.
+    """
+    names: dict[str, str] = {}
+    for row in ordered:
+        parts = [str(row.get("name", ""))]
+        parts += str(row.get("_path", "") or "").split(PATH_SEPARATOR)
+        for part in parts:
+            part = part.strip()
+            if part:
+                names.setdefault(part.lower(), part)
+    return list(names.values())
+
+
+def match_imported_rows(
+    ordered: list[dict[str, Any]],
+    candidates: list[JSONDict],
+    *,
+    started_at: str = "",
+) -> list[dict[str, Any]]:
+    """Match each import row to the term it became, by walking its path.
+
+    The import reports names and tallies, never ids — so assigning an asset or
+    re-parenting anything afterwards means finding each term again. *candidates*
+    are the terms whose names appear anywhere in the batch, from which a
+    ``(parentId, name)`` index rebuilds the hierarchy exactly: sibling names are
+    unique, so that pair identifies a term even when the same name is used under
+    several parents.
+
+    *started_at* is the import job's own creation timestamp. A term created
+    before the job began was already there and the job left it alone (or, with
+    ``update_existing``, replaced it) — which is the only way to tell that from
+    a term the job created, because the job counts both as successful.
+
+    A row whose term cannot be found comes back with ``term_id`` of ``None``
+    rather than being dropped, so a partial resolution stays visible.
+    """
+    index: dict[tuple[str | None, str], JSONDict] = {}
+    for item in candidates:
+        name = str(item.get("name", "")).strip().lower()
+        if name:
+            index[(item.get("parentId"), name)] = item
+
+    matched: list[dict[str, Any]] = []
+    for row in ordered:
+        parent_id: str | None = None
+        found = True
+        for level in str(row.get("_path", "") or "").split(PATH_SEPARATOR):
+            level = level.strip()
+            if not level:
+                continue
+            ancestor = index.get((parent_id, level.lower()))
+            if ancestor is None:
+                found = False
+                break
+            parent_id = ancestor.get("id")
+
+        name = str(row.get("name", "")).strip()
+        term = index.get((parent_id, name.lower())) if found else None
+        created = str((term or {}).get("creationTimeStamp") or "")
+        matched.append(
+            {
+                "name": row.get("name"),
+                "path": row.get("_path", ""),
+                "term_id": (term or {}).get("id"),
+                # Absent timestamps must not read as "already there": an
+                # unresolved row would otherwise be reported as pre-existing.
+                "existed": bool(term and started_at and created and created < started_at),
+            }
+        )
+    return matched
+
+
 def parse_import_log(text: str) -> list[dict[str, Any]]:
     """Pull the per-row failures out of an import job's log.
 
@@ -815,6 +896,8 @@ __all__ = [
     "is_empty",
     "matches_attribute_filter",
     "glossary_id_from_resource",
+    "import_lookup_names",
+    "match_imported_rows",
     "missing_required",
     "readable_attributes",
     "unmet_required",
