@@ -318,13 +318,13 @@ Two things about the glossary are worth knowing before you start, because both a
 
 *Authoring:*
 - **create_glossary_term**: Create a term. **Publishes by default** — the underlying API creates an invisible draft unless told otherwise
-- **import_glossary_terms**: Create many terms, and their hierarchy, in one call. Children name their parent instead of needing its id, so rows can be given in any order and no id is threaded between levels; per-row failures are reported individually
+- **import_glossary_terms**: Create many terms, and their hierarchy, in one call. Children name their parent instead of needing its id, so rows can be given in any order and no id is threaded between levels; per-row failures are reported individually. A row is written whole, so `update_existing` *replaces* the term at that path rather than merging into it
 - **update_glossary_term**: Change a term's text, parent or attributes. Merges onto the current term, so omitted fields are left alone rather than blanked; `parent_id` moves it in the hierarchy
-- **delete_glossary_term**: Permanently delete a term and every assignment that referenced it
+- **delete_glossary_term**: Permanently delete a term and every assignment that referenced it. There is no cascade — a term with children is refused, so delete a subtree leaf-first
 - **assign_glossary_term** / **unassign_glossary_term**: Attach a term to a table column, or detach it. This is the step that makes a term govern data — a term with no assigned assets governs nothing
 
 *Designing the vocabulary:*
-- **create_glossary_term_type** / **update_glossary_term_type** / **delete_glossary_term_type**: Define the template terms are created from — which custom attributes they carry, which are mandatory, and what values each accepts. An edit matches attributes by label and keeps each one's identifier, so terms already carrying a value do not lose it; delete refuses while terms still use the type
+- **create_glossary_term_type** / **update_glossary_term_type** / **delete_glossary_term_type**: Define the template terms are created from — which custom attributes they carry, which are mandatory, and what values each accepts. An edit matches attributes by label and keeps each one's identifier, so terms already carrying a value do not lose it — to *rename* one, give its `attribute_id` alongside the new label, since a new label matches nothing and would otherwise mint a new attribute; delete refuses while terms still use the type
 
 Terms assigned this way also become searchable through Tier 1's **catalog_search** using the `Column.term:"<term name>"` facet on the `datasets` index, which returns the tables carrying a term without resolving individual columns.
 

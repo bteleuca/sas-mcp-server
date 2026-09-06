@@ -437,10 +437,28 @@ def test_date_time_is_normalised_to_utc(value, expected):
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("15:41:28Z", "15:41:28Z"), ("15:41:28", "15:41:28Z"), ("15:41", "15:41:00Z")],
+    [
+        ("15:41:28Z", "15:41:28Z"),
+        ("15:41:28", "15:41:28Z"),
+        ("15:41", "15:41:00Z"),
+        # An offset is converted, not stripped. Dropping it stored a value two
+        # hours out with nothing to say so — the one failure mode worse than a
+        # rejection, and the one a date-time never had.
+        ("09:15:00+02:00", "07:15:00Z"),
+        ("09:15:00-02:00", "11:15:00Z"),
+        # No date to carry, so a conversion across midnight wraps within the day.
+        ("00:30:00+02:00", "22:30:00Z"),
+        ("23:30:00-02:00", "01:30:00Z"),
+    ],
 )
 def test_time_gets_its_seconds_and_z(value, expected):
     assert gh.encode_attribute(value, {"label": "Cutoff", "type": "time"}) == expected
+
+
+def test_an_impossible_time_is_rejected_rather_than_wrapped():
+    """Wrapping would turn a typo into a plausible-looking 01:00:00."""
+    with pytest.raises(ValueError, match="hh<24"):
+        gh.encode_attribute("25:00:00Z", {"label": "Cutoff", "type": "time"})
 
 
 @pytest.mark.parametrize(
@@ -462,6 +480,12 @@ def test_unparseable_dates_are_rejected_with_the_format_named(attr_type, value):
     assert attr_type in str(excinfo.value)
 
 
+def test_a_boolean_cannot_be_cleared_with_an_empty_string():
+    """Viya answers '' with `The value "" for the field "X" is invalid`."""
+    with pytest.raises(ValueError, match="cannot be cleared"):
+        gh.encode_attribute("", {"label": "Used in Risk", "type": "boolean"})
+
+
 def test_a_required_attribute_set_to_empty_counts_as_missing():
     """Viya rejects "" for a required attribute, so presence alone is not enough."""
     _, by_label = gh.attribute_maps(TERM_TYPE)
@@ -469,11 +493,48 @@ def test_a_required_attribute_set_to_empty_counts_as_missing():
         gh.encode_attributes({"Scope": ""}, by_label, require_all=True)
 
 
+def test_a_required_attribute_with_a_default_need_not_be_supplied_on_create():
+    """Verified live: an imported row omitting one came back holding the default."""
+    typed = {
+        "attributes": [
+            {"name": "attr-owner", "label": "Owner", "type": "single-line",
+             "required": True, "defaultValue": "unassigned"},
+        ]
+    }
+    _, by_label = gh.attribute_maps(typed)
+    assert gh.encode_attributes({}, by_label, require_all=True) == {}
+
+
 def test_missing_required_finds_the_gap_in_a_merged_term():
     _, by_label = gh.attribute_maps(TERM_TYPE)
     assert gh.missing_required({"attr-scope": "Group"}, by_label) == []
     assert gh.missing_required({"attr-scope": ""}, by_label) == ["Scope"]
     assert gh.missing_required({}, by_label) == ["Scope"]
+
+
+def test_a_required_boolean_set_to_false_is_not_missing():
+    """`False or ""` reads as empty, which refused an edit over a value that was there."""
+    typed = {
+        "attributes": [
+            {"name": "attr-flag", "label": "Flag", "type": "boolean", "required": True},
+        ]
+    }
+    _, by_label = gh.attribute_maps(typed)
+    assert gh.missing_required({"attr-flag": False}, by_label) == []
+    assert gh.missing_required({"attr-flag": ""}, by_label) == ["Flag"]
+
+
+def test_a_default_does_not_excuse_a_required_attribute_on_an_update():
+    """Defaults are applied when a term is created, not when one is rewritten."""
+    typed = {
+        "attributes": [
+            {"name": "attr-owner", "label": "Owner", "type": "single-line",
+             "required": True, "defaultValue": "unassigned"},
+        ]
+    }
+    _, by_label = gh.attribute_maps(typed)
+    assert gh.missing_required({}, by_label) == ["Owner"]
+
 
 def test_encode_attributes_maps_labels_case_insensitively():
     _, by_label = gh.attribute_maps(TERM_TYPE)
@@ -1218,6 +1279,40 @@ def test_duplicate_attribute_labels_are_refused():
         )
 
 
+def test_an_attribute_can_be_renamed_by_identifier():
+    """Matching by label cannot express a rename: the new label matches nothing."""
+    existing = [
+        {"name": "a1", "label": "Scope", "type": "single-line"},
+        {"name": "a2", "label": "Notes", "type": "multi-line"},
+    ]
+    built = gh.build_attribute_definitions(
+        [{"attribute_id": "a1", "label": "Coverage", "type": "single-line"}], existing
+    )
+    renamed = next(d for d in built if d["name"] == "a1")
+    assert renamed["label"] == "Coverage", "the stored values stay under a1"
+    assert [d["label"] for d in built] == ["Coverage", "Notes"], "no orphaned copy of Scope"
+
+
+def test_renaming_onto_a_label_another_attribute_holds_is_refused():
+    existing = [
+        {"name": "a1", "label": "Scope", "type": "single-line"},
+        {"name": "a2", "label": "Notes", "type": "multi-line"},
+    ]
+    with pytest.raises(ValueError, match="twice on this term type"):
+        gh.build_attribute_definitions(
+            [{"attribute_id": "a1", "label": "Notes", "type": "single-line"}], existing
+        )
+
+
+def test_an_unknown_attribute_id_is_refused():
+    """Silently minting a new UUID is how an intended rename loses every value."""
+    existing = [{"name": "a1", "label": "Scope", "type": "single-line"}]
+    with pytest.raises(ValueError, match="does not have"):
+        gh.build_attribute_definitions(
+            [{"attribute_id": "nope", "label": "Coverage", "type": "single-line"}], existing
+        )
+
+
 async def test_create_term_type_defaults_the_label_and_sends_definitions():
     """The API leaves label empty rather than defaulting it, showing as a blank."""
     fake = FakeViya()
@@ -1445,8 +1540,17 @@ def test_csv_quotes_a_multi_select_value():
     ordered = gh.resolve_import_paths([{"name": "A", "term_type": "T"}])
     ordered[0]["attributes"] = {"Regions": "EMEA,APAC"}
     csv = gh.build_term_csv(ordered, ["Regions"])
-    assert csv.startswith("Name,Type,Path,Description,Regions\r\n")
+    assert csv.startswith("Name,Type,Path,Definition,Description,Regions\r\n")
     assert '"EMEA,APAC"' in csv, "the comma must not split the column"
+
+
+def test_csv_keeps_definition_and_description_in_their_own_columns():
+    """Verified live: with no Definition column the importer uses the term's name."""
+    ordered = gh.resolve_import_paths([{"name": "A", "term_type": "T"}])
+    ordered[0]["definition"] = "what it means"
+    ordered[0]["description"] = "short overview"
+    csv = gh.build_term_csv(ordered, [])
+    assert csv.splitlines()[1] == "A,T,,what it means,short overview"
 
 
 def test_import_log_is_parsed_into_rows():
@@ -1473,8 +1577,16 @@ async def test_import_sends_a_csv_and_reports_what_was_created():
                 {
                     "term_type": "BCBS239",
                     "terms": [
-                        {"name": "Child", "parent": "Parent", "definition": "a child"},
-                        {"name": "Parent", "attributes": {"Used in Risk": True}},
+                        {
+                            "name": "Child",
+                            "parent": "Parent",
+                            "definition": "a child",
+                            "attributes": {"Scope": "Local"},
+                        },
+                        {
+                            "name": "Parent",
+                            "attributes": {"Scope": "Group", "Used in Risk": True},
+                        },
                     ],
                 },
             )
@@ -1484,9 +1596,9 @@ async def test_import_sends_a_csv_and_reports_what_was_created():
     assert result["order"] == ["Parent", "Child"], "parents must be emitted first"
     sent = next(p for p in fake.posted if p["path"] == "/glossary/importTerms")["body"]
     text = sent.decode("utf-8", "replace")
-    assert "Name,Type,Path,Description,Used in Risk" in text
-    assert "Parent,BCBS239,,,true" in text
-    assert "Child,BCBS239,Parent,a child," in text
+    assert "Name,Type,Path,Definition,Description,Scope,Used in Risk" in text
+    assert "Parent,BCBS239,,,,Group,true" in text
+    assert "Child,BCBS239,Parent,a child,,Local," in text
 
 
 async def test_import_reports_per_row_failures_from_the_log():
@@ -1502,7 +1614,13 @@ async def test_import_reports_per_row_failures_from_the_log():
         result = result_of(
             await client.call_tool(
                 "import_glossary_terms",
-                {"term_type": "BCBS239", "terms": [{"name": "Parent"}, {"name": "Child"}]},
+                {
+                    "term_type": "BCBS239",
+                    "terms": [
+                        {"name": "Parent", "attributes": {"Scope": "Group"}},
+                        {"name": "Child", "attributes": {"Scope": "Local"}},
+                    ],
+                },
             )
         )
     assert result["created"] == 1
@@ -1546,6 +1664,41 @@ async def test_import_validates_attributes_before_sending_anything():
                 },
             )
     assert not [p for p in fake.posted if p["path"] == "/glossary/importTerms"]
+
+
+async def test_import_refuses_a_row_missing_a_required_attribute():
+    """Otherwise the row fails inside the job, after the rest is already committed."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        with pytest.raises(Exception, match="requires attribute"):
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [
+                        {"name": "Good", "attributes": {"Scope": "Group"}},
+                        {"name": "Bad", "attributes": {"Used in Risk": True}},
+                    ],
+                },
+            )
+    assert not [p for p in fake.posted if p["path"] == "/glossary/importTerms"]
+
+
+async def test_import_reports_the_job_counts_verbatim():
+    """'successful' counts rows the job accepted, including ones left untouched."""
+    fake = FakeViya()
+    fake.import_counts = {"successful": 1, "errors": 0, "warnings": 2}
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "import_glossary_terms",
+                {
+                    "term_type": "BCBS239",
+                    "terms": [{"name": "A", "attributes": {"Scope": "Group"}}],
+                },
+            )
+        )
+    assert result["counts"] == {"successful": 1, "errors": 0, "warnings": 2}
 
 
 async def test_import_rejects_an_empty_batch():

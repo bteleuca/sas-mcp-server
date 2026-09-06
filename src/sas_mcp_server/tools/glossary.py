@@ -57,6 +57,7 @@ from ..helpers.glossary_helpers import (
     parse_import_log,
     readable_attributes,
     resolve_import_paths,
+    unmet_required,
 )
 from ..viya_client import (
     JSONDict,
@@ -630,6 +631,13 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         caller does not mention is left alone; a label that does not exist yet
         is added.
 
+        **To rename one, give its ``attribute_id``** alongside the new
+        ``label``. Matching by label alone cannot express a rename: the new
+        label matches nothing, so the attribute is added afresh under a new
+        identifier and every term's value stays behind under the old one, no
+        longer readable as that attribute. ``get_glossary_term_type`` returns
+        the id of each.
+
         Making an attribute ``required`` applies to terms created *afterwards*
         and to every later edit of the ones already there: an update rewrites
         the whole term, so older terms must be given a value for it before they
@@ -641,7 +649,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             label: New display name.
             description: New description.
             attributes: Attributes to add or change, same shape as
-                ``create_glossary_term_type``. Omitted attributes survive.
+                ``create_glossary_term_type``, plus an optional
+                ``attribute_id`` naming which existing attribute the spec is —
+                required to rename one. Omitted attributes survive.
             remove_attributes: Labels to drop from the type. Terms keep the
                 stored value, but under an identifier nothing names any more, so
                 it stops being readable as that attribute.
@@ -1026,8 +1036,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         The raw API returns ``attributes`` keyed by attribute-definition UUID,
         which is unreadable on its own. This resolves each key to the label the
         glossary UI shows and drops the ones left empty, so what comes back is
-        the term as a person would read it; ``attribute_ids`` keeps the raw
-        mapping for anything that needs it.
+        the term as a person would read it. ``attribute_ids`` is the raw map,
+        unfiltered — so an attribute the term leaves unset is absent from
+        ``attributes`` but present as ``""`` there. The two disagree by design:
+        one says what the term holds, the other what was stored.
 
         Also returns ``catalog_entity_id`` — the *other* id this term has, the
         one asset relationships point at.
@@ -1265,7 +1277,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         * **date** — ``"2026-09-04"``
         * **date-time** — ``"2026-09-04T13:41:24Z"``; a bare date or a numeric
           offset is normalised to UTC rather than rejected
-        * **time** — ``"15:41:28Z"``; seconds and the ``Z`` are required
+        * **time** — ``"15:41:28Z"``; seconds and the ``Z`` are required, and a
+          numeric offset is converted to UTC rather than dropped
 
         Values are validated before the call, so a mistake comes back naming the
         attribute and what it expected, instead of as an opaque HTTP 400.
@@ -1346,7 +1359,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         current one first and merges your changes into it: omitting an argument
         leaves that field alone rather than blanking it. ``attributes`` merges
         the same way, per attribute — pass only the ones you are changing, and
-        set one to ``""`` to clear it.
+        set one to ``""`` to clear it. A **boolean** is the exception: the
+        glossary has no empty boolean and rejects ``""``, so set it to
+        ``True``/``False`` rather than trying to clear it.
 
         Because the whole term is rewritten, every attribute the type marks
         **required** must hold a value — including ones made required after this
@@ -1415,6 +1430,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "name": updated.get("name"),
                 "status": updated.get("status"),
                 "version": updated.get("version"),
+                # Returned whether or not it was the thing changed: a re-parent
+                # is otherwise unconfirmable without a second call.
+                "parent_id": updated.get("parentId"),
                 "attributes": readable_attributes(updated.get("attributes"), by_uuid),
             }
 
@@ -1441,7 +1459,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
 
         Attribute values take the same forms as ``create_glossary_term`` —
         ``True``/``False`` for a boolean, a list for a multi-select — and are
-        validated here, per term type, before anything is sent.
+        validated here, per term type, before anything is sent. So are the term
+        type's **required** attributes: a row missing one fails inside the job
+        with a message naming only the field, so the batch is refused here
+        instead, before any of it is committed.
 
         **The import runs as a job and reports rows individually.** A row can
         fail while the rest succeed, so the result carries ``created``,
@@ -1449,13 +1470,24 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         non-empty ``failures`` as a partial import: the successful rows are
         already committed.
 
+        Two things the import does that a per-term create does not:
+
+        * **A row is written whole.** With ``update_existing`` the term at that
+          path is *replaced*, so an attribute the row omits is reset — not left
+          as it was. Without it the existing term is left alone, and the job
+          still counts the row as processed, so ``created`` counts rows the job
+          accepted rather than terms that are new.
+        * **Omitted attributes take the term type's default**, on new rows as
+          well as replaced ones — the same as creating a term through the API.
+
         Args:
             terms: The rows to create. Each is
-                ``{"name": ..., "parent": ..., "definition": ..., "attributes": {...}}``;
-                ``term_type`` may be given per row to mix types in one batch.
+                ``{"name": ..., "parent": ..., "definition": ...,
+                "description": ..., "attributes": {...}}``; ``term_type`` may be
+                given per row to mix types in one batch.
             term_type: The term type for rows that do not name one.
-            update_existing: Overwrite a term that already exists at the same
-                path (default false, which fails that row instead).
+            update_existing: Replace a term that already exists at the same path
+                (default false, which leaves it untouched).
             timeout_seconds: How long to wait for the import job (default 600).
         """
         if not terms:
@@ -1514,14 +1546,28 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                     used_labels[real.strip().lower()] = real
                     value = encode_attribute(value, definition)
                     encoded[real] = "true" if value is True else "false" if value is False else value
+                unmet = unmet_required(encoded, by_label, key="label")
+                if unmet:
+                    # create_glossary_term makes the same check. Without it here
+                    # the row reaches the job and fails with Viya's ``The value
+                    # "Owner" for the field "attributes" is invalid``, which
+                    # names the attribute but not what is wrong with it — and by
+                    # then the rest of the batch is already committed.
+                    raise ValueError(
+                        f"term {row.get('name')!r}: term type {name!r} requires attribute(s) "
+                        f"{unmet}, which this row does not supply. "
+                        "get_glossary_term_type lists each one's type and allowed values."
+                    )
                 rows.append(
                     {
                         "name": row.get("name"),
                         "term_type": name,
                         "parent": row.get("parent"),
-                        # The import's Description column is the term's
-                        # definition — the field a reader actually sees.
-                        "description": row.get("definition") or row.get("description") or "",
+                        # Definition and Description are separate columns and
+                        # separate fields. With no Definition column the
+                        # importer sets the definition to the term's own name.
+                        "definition": row.get("definition") or "",
+                        "description": row.get("description") or "",
                         "attributes": encoded,
                     }
                 )
@@ -1550,6 +1596,10 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 "job_id": job_id,
                 "order": [row["name"] for row in ordered],
                 "failures": failures,
+                # Verbatim, because "successful" counts a row the job accepted —
+                # including one whose term already existed and was left alone.
+                # Anything else the job tallies is visible rather than dropped.
+                "counts": counts,
             }
             if failures:
                 # The job's own state is "completed" even when every row failed,
@@ -1567,7 +1617,12 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         The term goes, and with it every assignment to a column that referenced
         it — the data keeps its columns but loses the documented meaning. Check
         ``list_term_assets`` first: a term with assigned assets is in use.
-        Deleting a parent term also affects its children.
+
+        **There is no cascade.** A term that has children cannot be deleted at
+        all: the glossary refuses with ``Cannot delete a term/draft with
+        existing children``. Delete the subtree leaf-first — list a term's
+        children with ``list_glossary_terms(parent_id=...)`` — or re-parent them
+        with ``update_glossary_term`` before deleting this one.
 
         Args:
             term_id: The glossary term UUID.

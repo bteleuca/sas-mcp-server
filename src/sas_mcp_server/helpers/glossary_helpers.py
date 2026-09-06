@@ -56,13 +56,14 @@ WIRE_FORMATS: dict[str, str] = {
     "multi-select": "one or more of the allowed values; pass a list",
     "date": "yyyy-mm-dd",
     "date-time": "yyyy-mm-ddThh:mm:ssZ (UTC; offsets are converted)",
-    "time": "hh:mm:ssZ (UTC; seconds required)",
+    "time": "hh:mm:ssZ (UTC; seconds required; offsets are converted)",
 }
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DATETIME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}(?::\d{2})?)(\.\d{1,3})?(.*)$")
 _TIME_RE = re.compile(r"^(\d{2}):(\d{2})(?::(\d{2}))?(\.\d{1,3})?(.*)$")
 _OFFSET_RE = re.compile(r"^([+-])(\d{2}):?(\d{2})$")
+_SECONDS_IN_A_DAY = 24 * 60 * 60
 
 # Multi-select values are stored as one comma-joined string with no spaces. Viya
 # rejects a JSON array, "a, b" and "a;b" alike, so the join happens here.
@@ -246,15 +247,33 @@ def _encode_datetime(value: Any, definition: JSONDict) -> str:
 
 
 def _encode_time(value: Any, definition: JSONDict) -> str:
-    """Normalise to ``hh:mm:ssZ``, both the seconds and the ``Z`` being required."""
+    """Normalise to ``hh:mm:ssZ``, both the seconds and the ``Z`` being required.
+
+    An offset is *converted*, as it is for a date-time, not dropped: storing
+    ``09:15:00+02:00`` as ``09:15:00Z`` would be two hours wrong and say nothing
+    about it, which is worse than either accepting or rejecting the value. With
+    no date to carry, a conversion that crosses midnight wraps within the day —
+    a time attribute is a time of day, not an instant.
+    """
     text = str(value).strip()
     match = _TIME_RE.match(text)
     if not match:
         _fail(definition, value, "hh:mm:ssZ")
         raise AssertionError("unreachable")
     hours, minutes, seconds, _millis, rest = match.groups()
-    _normalise_offset(rest, definition, value)
-    return f"{hours}:{minutes}:{seconds or '00'}Z"
+    if int(hours) > 23 or int(minutes) > 59 or int(seconds or 0) > 59:
+        # Caught here because the wrap below would otherwise turn 25:00:00 into
+        # a plausible-looking 01:00:00 rather than reporting the typo.
+        _fail(definition, value, "hh:mm:ssZ with hh<24, mm<60 and ss<60")
+    suffix = _normalise_offset(rest, definition, value)
+    total = int(hours) * 3600 + int(minutes) * 60 + int(seconds or 0)
+    offset = _OFFSET_RE.match(suffix)
+    if offset:
+        sign, off_hours, off_minutes = offset.groups()
+        shift = int(off_hours) * 3600 + int(off_minutes) * 60
+        total += -shift if sign == "+" else shift
+    total %= _SECONDS_IN_A_DAY
+    return f"{total // 3600:02d}:{total // 60 % 60:02d}:{total % 60:02d}Z"
 
 
 def _encode_date(value: Any, definition: JSONDict) -> str:
@@ -277,12 +296,20 @@ def encode_attribute(value: Any, definition: JSONDict) -> Any:
     other form, with an error naming only the attribute — so the shaping and the
     validation happen here, where the caller's input can still be named.
     """
+    attr_type = (definition.get("type") or "").lower()
     # An empty value clears the attribute, which is how the glossary itself
     # stores an unset one. It has to bypass the checks below, or a required
     # single-select could be set once and never cleared again.
     if value is None or value == "":
+        if attr_type == "boolean":
+            # The one type with no empty form: Viya answers ``The value "" for
+            # the field "<label>" is invalid``. Saying so here is the whole
+            # point of encoding, and a boolean has a third state nowhere else.
+            raise ValueError(
+                f"attribute '{definition.get('label')}' is a boolean and cannot be cleared: "
+                "the glossary has no empty boolean and rejects ''. Set it to true or false."
+            )
         return ""
-    attr_type = (definition.get("type") or "").lower()
     if attr_type == "boolean":
         return _encode_boolean(value, definition)
     if attr_type == "multi-select":
@@ -331,17 +358,76 @@ def encode_attributes(
     if require_all:
         # An explicit "" counts as absent: it is what the glossary stores for an
         # unset attribute, so a required one set to it is rejected server-side.
-        missing = sorted(
-            d.get("label", "")
-            for d in by_label.values()
-            if d.get("required") and encoded.get(d["name"], "") == ""
-        )
+        missing = unmet_required(encoded, by_label, key="name")
         if missing:
             raise ValueError(
                 f"this term type requires attribute(s) {missing}, which were not supplied. "
                 "get_glossary_term_type lists each one's type and allowed values."
             )
     return encoded
+
+
+def is_empty(value: Any) -> bool:
+    """Is this attribute value the glossary's idea of unset?
+
+    ``False`` is *not* empty. It reads as one under ``value or ""``, which is
+    how a boolean set to false came to be reported as a missing required
+    attribute — an edit refused over a value that was there all along.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set)):
+        return not value
+    return False
+
+
+def has_default(definition: JSONDict) -> bool:
+    """Does this attribute declare a default the glossary fills in when omitted?
+
+    A required attribute with a default is never actually missing: the service
+    applies the default on create and on import — verified live, a required
+    attribute omitted from an imported row came back holding its default — so
+    refusing the call here would reject what the service would have accepted.
+    """
+    return not is_empty(definition.get("defaultValue"))
+
+
+def unmet_required(
+    values: dict[str, Any],
+    by_label: dict[str, JSONDict],
+    *,
+    key: str = "name",
+    defaults_apply: bool = True,
+) -> list[str]:
+    """Required attribute labels that *values* leaves empty.
+
+    *key* says how *values* is keyed: ``"name"`` for the UUID-keyed map the API
+    stores, ``"label"`` for the label-keyed rows an import is built from.
+
+    *defaults_apply* covers a required attribute that declares a default, which
+    the service fills in — but only where it does. It does so on create and on
+    import; an update replays the term's stored attributes and has no such step,
+    so a value the term never received is genuinely missing there.
+    """
+    lookup = (
+        {str(k).strip().lower(): v for k, v in values.items()} if key == "label" else values
+    )
+    unmet = []
+    for definition in by_label.values():
+        if not definition.get("required"):
+            continue
+        if defaults_apply and has_default(definition):
+            continue
+        wanted = (
+            (definition.get("label") or "").strip().lower()
+            if key == "label"
+            else definition.get("name", "")
+        )
+        if is_empty(lookup.get(wanted)):
+            unmet.append(definition.get("label", ""))
+    return sorted(unmet)
 
 
 def missing_required(merged: dict[str, Any], by_label: dict[str, JSONDict]) -> list[str]:
@@ -352,13 +438,10 @@ def missing_required(merged: dict[str, Any], by_label: dict[str, JSONDict]) -> l
     that replay carries an empty value for it and Viya rejects the write —
     naming an attribute the caller never mentioned, on an edit to something
     else. Checking the merged term first turns that into a message that says
-    which attribute and why.
+    which attribute and why. A declared default does not save it: defaults are
+    applied when a term is created, not when one is rewritten.
     """
-    return sorted(
-        d.get("label", "")
-        for d in by_label.values()
-        if d.get("required") and str(merged.get(d["name"], "") or "") == ""
-    )
+    return unmet_required(merged, by_label, key="name", defaults_apply=False)
 
 
 
@@ -391,17 +474,24 @@ def build_attribute_definitions(
 
     Each definition is keyed by a UUID in its ``name`` field, and **that UUID is
     what every existing term's stored values are filed under**. So an edit
-    matches an incoming spec to an existing definition *by label* and keeps its
-    UUID: mint a fresh one and every term of that type silently loses the value,
-    with the old key left orphaned in its attribute map.
+    matches an incoming spec to an existing definition and keeps its UUID: mint
+    a fresh one and every term of that type silently loses the value, with the
+    old key left orphaned in its attribute map.
+
+    Matching is by label by default, which is enough to add, edit and reorder —
+    but not to **rename**, because a new label matches nothing and so mints a
+    new UUID. A spec may therefore give ``attribute_id`` (as
+    ``get_glossary_term_type`` returns it) to say *which* attribute it is,
+    leaving ``label`` free to be the new name.
 
     The API will not mint the UUIDs itself — omitting them fails with ``The
     value for field "name" must be unique``, which names neither the attribute
     nor the real problem.
 
     Args:
-        specs: ``{label, type, required?, allowed_values?, default?, description?}``
-            per attribute. ``None`` keeps *existing* untouched.
+        specs: ``{label, type, required?, allowed_values?, default?,
+            description?, attribute_id?}`` per attribute. ``None`` keeps
+            *existing* untouched.
         existing: the type's current definitions, whose UUIDs are preserved.
         remove: labels to drop. Terms keep the stored value under its now
             unknown UUID rather than losing it outright.
@@ -409,6 +499,7 @@ def build_attribute_definitions(
     by_label = {
         (d.get("label") or "").strip().lower(): d for d in (existing or []) if d.get("label")
     }
+    by_id = {d["name"]: d for d in (existing or []) if d.get("name")}
     dropped = {label.strip().lower() for label in (remove or [])}
     unknown = dropped - by_label.keys()
     if unknown:
@@ -423,6 +514,7 @@ def build_attribute_definitions(
 
     built: list[JSONDict] = []
     seen: set[str] = set()
+    reused: set[str] = set()
     for spec in specs:
         label = str(spec.get("label", "")).strip()
         if not label:
@@ -431,6 +523,17 @@ def build_attribute_definitions(
         if key in seen:
             raise ValueError(f"attribute label '{label}' is given twice; labels must be unique.")
         seen.add(key)
+
+        attribute_id = str(spec.get("attribute_id", "") or "").strip()
+        if attribute_id and attribute_id not in by_id:
+            raise ValueError(
+                f"attribute '{label}' names attribute_id {attribute_id!r}, which this term "
+                f"type does not have. get_glossary_term_type returns the id of each one. "
+                "Omit it to add a new attribute."
+            )
+        previous = by_id.get(attribute_id) if attribute_id else by_label.get(key)
+        if previous is not None:
+            reused.add(previous.get("name", ""))
 
         attr_type = str(spec.get("type", "")).strip().lower()
         if attr_type not in ATTRIBUTE_TYPES:
@@ -451,7 +554,6 @@ def build_attribute_definitions(
                 f"only {list(_CHOICE_TYPES)} do."
             )
 
-        previous = by_label.get(key)
         definition: JSONDict = {
             # Reuse the existing UUID so terms already carrying a value keep it.
             "name": (previous or {}).get("name") or str(uuid.uuid4()),
@@ -474,9 +576,23 @@ def build_attribute_definitions(
 
     # Anything the caller did not mention survives, unless explicitly removed —
     # the same merge rule update_glossary_term uses for a term's own fields.
+    # Survival is decided by identity, not by label: an attribute a spec renamed
+    # has already been rebuilt and must not reappear under its old label, while
+    # one whose label a *different* spec has taken over is still its own
+    # attribute and must not vanish because the name now reads as mentioned.
     for key, definition in by_label.items():
-        if key not in seen and key not in dropped:
-            built.append(definition)
+        if key in dropped or definition.get("name", "") in reused:
+            continue
+        built.append(definition)
+
+    labels = [str(d.get("label", "")).strip().lower() for d in built]
+    clashes = sorted({label for label in labels if labels.count(label) > 1})
+    if clashes:
+        raise ValueError(
+            f"attribute label(s) {clashes} would appear twice on this term type. Renaming an "
+            "attribute onto a label another one already uses needs that other one renamed or "
+            "removed in the same call."
+        )
     return built
 
 
@@ -523,10 +639,15 @@ def matches_attribute_filter(readable: dict[str, Any], wanted: dict[str, Any]) -
 # The columns the import reads as the term itself rather than as a custom
 # attribute. The first occurrence of one of these names in the header wins, so
 # an attribute sharing one of these labels cannot be set through an import.
+#
+# ``definition`` belongs here — verified live: a term type with an attribute
+# labelled "Definition" imported through a column of that name left the
+# attribute unset and wrote the value to the term's own definition instead.
 IMPORT_SYSTEM_COLUMNS: tuple[str, ...] = (
     "name",
     "type",
     "path",
+    "definition",
     "description",
     "requirements",
     "status",
@@ -619,8 +740,14 @@ def build_term_csv(rows: list[dict[str, Any]], attribute_columns: list[str]) -> 
     *rows* come from :func:`resolve_import_paths`, so each carries ``_path``.
     Values are already encoded — a boolean as ``true``/``false``, a multi-select
     as its comma-joined string — so this only quotes and joins them.
+
+    ``Definition`` and ``Description`` are separate system columns and are *not*
+    interchangeable: with no ``Definition`` column the importer sets the term's
+    definition to its own name, which is what a whole hierarchy imported without
+    one comes back holding. Both are always written, empty when unset, so the
+    field a reader actually sees is the one the caller wrote.
     """
-    header = ["Name", "Type", "Path", "Description", *attribute_columns]
+    header = ["Name", "Type", "Path", "Definition", "Description", *attribute_columns]
     buffer = io.StringIO()
     # Records are CRLF-terminated, as a CSV export from the UI produces.
     writer = csv.writer(buffer, lineterminator="\r\n")
@@ -633,6 +760,7 @@ def build_term_csv(rows: list[dict[str, Any]], attribute_columns: list[str]) -> 
                 row.get("name", ""),
                 row.get("term_type", "") or "",
                 row.get("_path", ""),
+                row.get("definition", "") or "",
                 row.get("description", "") or "",
                 *[lowered.get(label.strip().lower(), "") for label in attribute_columns],
             ]
@@ -683,8 +811,11 @@ __all__ = [
     "decode_attribute",
     "encode_attribute",
     "encode_attributes",
+    "has_default",
+    "is_empty",
     "matches_attribute_filter",
     "glossary_id_from_resource",
     "missing_required",
     "readable_attributes",
+    "unmet_required",
 ]

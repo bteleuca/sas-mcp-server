@@ -2104,6 +2104,7 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                                 "allowed_values": ["Gold", "Silver"],
                             },
                             {"label": "Masked", "type": "boolean", "default": False},
+                            {"label": "Cutoff", "type": "time"},
                         ],
                     },
                 )
@@ -2111,7 +2112,7 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
             type_id = created["term_type_id"]
             assert created["label"] == type_name, "label must default from name"
             before = {a["label"]: a["attribute_id"] for a in created["attributes"]}
-            assert set(before) == {"Owner", "Tier", "Masked"}
+            assert set(before) == {"Owner", "Tier", "Masked", "Cutoff"}
 
             # A term of the new type, exercising every value form at once.
             term = (
@@ -2121,12 +2122,21 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                         "name": f"MCP_TEST_TYPED_TERM_{_SUFFIX}",
                         "term_type": type_id,
                         "definition": "Integration test term.",
-                        "attributes": {"Owner": "data-office", "Tier": "Gold", "Masked": True},
+                        "attributes": {
+                            "Owner": "data-office",
+                            "Tier": "Gold",
+                            "Masked": True,
+                            # An offset must be converted, not dropped: stored
+                            # as given this would be two hours wrong and say
+                            # nothing about it.
+                            "Cutoff": "09:15:00+02:00",
+                        },
                     },
                 )
             ).data
             term_id = term["term_id"]
             assert term["attributes"]["Masked"] is True, "a boolean must survive as a boolean"
+            assert term["attributes"]["Cutoff"] == "07:15:00Z"
 
             # Deleting a type in use would take those definitions with it.
             with pytest.raises(Exception, match="term"):
@@ -2149,7 +2159,7 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                 )
             ).data
             after = {a["label"]: a for a in evolved["attributes"]}
-            assert set(after) == {"Owner", "Tier", "Masked", "Review date"}
+            assert set(after) == {"Owner", "Tier", "Masked", "Cutoff", "Review date"}
             assert after["Tier"]["attribute_id"] == before["Tier"], "identifier must survive"
             assert after["Owner"]["attribute_id"] == before["Owner"]
             assert after["Tier"]["allowed_values"] == ["Gold", "Silver", "Bronze"]
@@ -2212,6 +2222,37 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                     {"term_type": type_id, "attribute_filter": {"Maskd": True}},
                 )
 
+            # Renaming needs the attribute's identifier: matched by label alone
+            # the new name matches nothing, so the attribute is added afresh and
+            # every term's value stays behind under the old id, readable as
+            # nothing. Owner is required, which makes the loss louder still.
+            renamed = (
+                await client.call_tool(
+                    "update_glossary_term_type",
+                    {
+                        "term_type_id": type_id,
+                        "attributes": [
+                            {
+                                "attribute_id": before["Owner"],
+                                "label": "Steward",
+                                "type": "single-line",
+                                "required": True,
+                            }
+                        ],
+                    },
+                )
+            ).data
+            renamed_by_label = {a["label"]: a for a in renamed["attributes"]}
+            assert "Owner" not in renamed_by_label, "no orphaned copy under the old label"
+            assert renamed_by_label["Steward"]["attribute_id"] == before["Owner"]
+
+            still_there = (
+                await client.call_tool("get_glossary_term", {"term_id": term_id})
+            ).data
+            assert still_there["attributes"]["Steward"] == "data-office", (
+                "the stored value must read under the new name"
+            )
+
             dropped = (
                 await client.call_tool(
                     "update_glossary_term_type",
@@ -2255,6 +2296,10 @@ async def test_glossary_bulk_import(integration_mcp_server):
                             {"label": "Tier", "type": "single-select",
                              "allowed_values": ["Gold", "Silver"]},
                             {"label": "Masked", "type": "boolean"},
+                            # Required *and* defaulted: the service fills it in,
+                            # so omitting it from every row must not be refused.
+                            {"label": "Stage", "type": "single-line",
+                             "required": True, "default": "draft"},
                         ],
                     },
                 )
@@ -2270,6 +2315,7 @@ async def test_glossary_bulk_import(integration_mcp_server):
                             {"name": f"{prefix} Leaf", "parent": f"{prefix} Mid",
                              "attributes": {"Tier": "Silver", "Masked": False}},
                             {"name": f"{prefix} Root", "definition": "imported root",
+                             "description": "imported root overview",
                              "attributes": {"Tier": "Gold", "Masked": True}},
                             {"name": f"{prefix} Mid", "parent": f"{prefix} Root"},
                         ],
@@ -2299,6 +2345,21 @@ async def test_glossary_bulk_import(integration_mcp_server):
             # Attribute values survive the CSV round trip in their own types.
             assert by_name[f"{prefix} Root"]["attributes"]["Masked"] is True
             assert by_name[f"{prefix} Leaf"]["attributes"]["Tier"] == "Silver"
+
+            # Definition and Description are separate CSV columns and separate
+            # fields. Write only one of them and the service fills the
+            # definition in with the term's own name, which is how a whole
+            # imported hierarchy came back reading like a list of labels.
+            root = by_name[f"{prefix} Root"]
+            assert root["definition"] == "imported root"
+            assert root["description"] == "imported root overview"
+            # What the service does with an *empty* Definition cell is its own
+            # business; what matters is that a supplied one is not the
+            # description and is not the term's name.
+            assert root["definition"] != root["name"]
+
+            # Required, but defaulted: no row supplied it and none was refused.
+            assert by_name[f"{prefix} Mid"]["attributes"]["Stage"] == "draft"
 
             # A bad value is caught here, before anything is sent.
             with pytest.raises(Exception, match="only accepts"):
