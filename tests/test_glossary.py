@@ -165,11 +165,22 @@ class FakeViya:
         self.relationships: list[dict[str, Any]] = [RELATIONSHIP]
         self.import_counts: dict[str, int] = {"successful": 0, "errors": 0, "warnings": 0}
         self.import_log = "The term import process has completed.\n"
+        # A draft is a separate resource: readable and deletable at the ordinary
+        # path, writable only at /draft, and promoted at /draft/state. Modelled
+        # here because getting the path wrong is a 404 the tier has to avoid.
+        self.term_is_draft = False
+        self.publish_calls: list[dict[str, str]] = []
 
     # -- helpers ----------------------------------------------------------
     @staticmethod
     def _json(payload: Any, status: int = 200) -> httpx.Response:
         return httpx.Response(status, json=payload)
+
+    def _term(self) -> dict[str, Any]:
+        """The term as it currently stands, published or still a draft."""
+        if not self.term_is_draft:
+            return TERM
+        return {**TERM, "isDraft": True, "status": None}
 
     @staticmethod
     def _ids_in(filter_expr: str, field: str) -> list[str]:
@@ -234,9 +245,35 @@ class FakeViya:
         if method == "GET" and path.startswith("/glossary/termTypes/"):
             return self._json(TERM_TYPE)
         if method == "GET" and path == "/glossary/terms":
-            return self._json({"items": [TERM], "count": 1})
+            return self._json({"items": [self._term()], "count": 1})
+
+        # --- the draft resource, which lives beside the term ------------------
+        if path.startswith("/glossary/terms/") and path.endswith("/draft/state"):
+            if method != "PUT":
+                return self._json({"message": "Not Found"}, 404)
+            if not self.term_is_draft:
+                # What a real deployment answers: there is no draft to promote.
+                return self._json({"message": "Not Found", "errorCode": 76900}, 404)
+            self.publish_calls.append(dict(request.url.params))
+            self.term_is_draft = False
+            return self._json(self._term())
+        if path.startswith("/glossary/terms/") and path.endswith("/draft"):
+            if not self.term_is_draft:
+                return self._json({"message": "Not Found"}, 404)
+            if method == "PUT":
+                body = json.loads(request.content)
+                self.put_bodies.append(body)
+                return self._json({**body, "version": TERM["version"] + 1})
+            if method == "DELETE":
+                self.deleted.append(path)
+                return httpx.Response(204)
+            return self._json(self._term())
+
         if method == "GET" and path.startswith("/glossary/terms/"):
-            return self._json(TERM)
+            return self._json(self._term())
+        if method == "PUT" and self.term_is_draft and path.startswith("/glossary/terms/"):
+            # A plain PUT on a draft is a 404, not a validation error.
+            return self._json({"message": "Not Found"}, 404)
         if method == "POST" and path == "/glossary/importTerms":
             self.posted.append({"path": path, "body": request.content, "params": {}})
             return self._json({"id": "job-1", "state": "running"}, 202)
@@ -1084,6 +1121,62 @@ async def test_update_can_clear_one_attribute():
     assert fake.put_bodies[0]["attributes"]["attr-note"] == ""
     # The others survive the whole-resource PUT.
     assert fake.put_bodies[0]["attributes"]["attr-scope"] == "Group"
+
+
+# --- drafts -------------------------------------------------------------------
+# A draft is a separate resource. Verified live: the ordinary path answers GET
+# and DELETE for one but 404s on PUT, and the draft's own `links` name
+# /draft for the edit and /draft/state?action=publish for the promotion.
+
+
+async def test_editing_a_draft_writes_to_the_draft_path():
+    """The ordinary path 404s on a draft, so an edit there is lost entirely."""
+    fake = FakeViya()
+    fake.term_is_draft = True
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "update_glossary_term", {"term_id": TERM_ID, "definition": "revised"}
+        )
+    written = [r for r in fake.requests if r.method == "PUT"]
+    assert [r.url.path for r in written] == [f"/glossary/terms/{TERM_ID}/draft"]
+    assert fake.put_bodies[0]["definition"] == "revised"
+
+
+async def test_a_draft_can_be_published():
+    fake = FakeViya()
+    fake.term_is_draft = True
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "update_glossary_term", {"term_id": TERM_ID, "publish": True}
+            )
+        )
+    assert fake.publish_calls == [{"action": "publish"}]
+    assert result["is_draft"] is False
+    assert result["status"] == "Published"
+
+
+async def test_publishing_a_published_term_reports_it_rather_than_failing():
+    """`/draft/state` answers a published term with a 404, which reads as 'gone'."""
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        result = result_of(
+            await client.call_tool(
+                "update_glossary_term", {"term_id": TERM_ID, "publish": True}
+            )
+        )
+    assert fake.publish_calls == []
+    assert "already published" in result["note"]
+    assert result["is_draft"] is False
+
+
+async def test_an_ordinary_update_does_not_touch_the_draft_endpoints():
+    fake = FakeViya()
+    async with glossary_client(fake) as client:
+        await client.call_tool(
+            "update_glossary_term", {"term_id": TERM_ID, "definition": "revised"}
+        )
+    assert not [r for r in fake.requests if "/draft" in r.url.path]
 
 
 async def test_delete_calls_the_glossary_not_the_catalog():

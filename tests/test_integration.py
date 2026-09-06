@@ -2222,6 +2222,75 @@ async def test_glossary_term_type_lifecycle(integration_mcp_server):
                     {"term_type": type_id, "attribute_filter": {"Maskd": True}},
                 )
 
+            # A draft is a separate resource: readable and deletable at the
+            # ordinary path, writable only at /draft, and promoted at
+            # /draft/state. Getting that wrong is a 404, so the whole cycle —
+            # create unpublished, edit, publish — is exercised here.
+            draft = (
+                await client.call_tool(
+                    "create_glossary_term",
+                    {
+                        "name": f"MCP_TEST_DRAFT_{_SUFFIX}",
+                        "term_type": type_id,
+                        "definition": "before",
+                        # Still called Owner here: the rename comes below.
+                        "attributes": {"Owner": "data-office"},
+                        "publish": False,
+                    },
+                )
+            ).data
+            draft_id = draft["term_id"]
+            try:
+                assert draft["is_draft"] is True
+
+                hidden = (
+                    await client.call_tool(
+                        "list_glossary_terms", {"term_type": type_id, "limit": 20}
+                    )
+                ).data
+                assert draft_id not in {i["term_id"] for i in hidden["items"]}, (
+                    "a draft must not show in the published listing"
+                )
+                shown = (
+                    await client.call_tool(
+                        "list_glossary_terms",
+                        {"term_type": type_id, "limit": 20, "include_drafts": True},
+                    )
+                ).data
+                assert draft_id in {i["term_id"] for i in shown["items"]}
+
+                edited = (
+                    await client.call_tool(
+                        "update_glossary_term",
+                        {"term_id": draft_id, "definition": "after"},
+                    )
+                ).data
+                assert edited["is_draft"] is True, "editing must not publish it"
+
+                promoted = (
+                    await client.call_tool(
+                        "update_glossary_term", {"term_id": draft_id, "publish": True}
+                    )
+                ).data
+                assert promoted["is_draft"] is False
+                assert promoted["status"] == "Published"
+
+                settled = (
+                    await client.call_tool("get_glossary_term", {"term_id": draft_id})
+                ).data
+                assert settled["definition"] == "after", "the edit survived the publish"
+
+                # There is no draft left, so this is a no-op with a reason
+                # rather than the 404 the service would answer.
+                again = (
+                    await client.call_tool(
+                        "update_glossary_term", {"term_id": draft_id, "publish": True}
+                    )
+                ).data
+                assert "already published" in again.get("note", "")
+            finally:
+                await client.call_tool("delete_glossary_term", {"term_id": draft_id})
+
             # Renaming needs the attribute's identifier: matched by label alone
             # the new name matches nothing, so the attribute is added afresh and
             # every term's value stays behind under the old id, readable as

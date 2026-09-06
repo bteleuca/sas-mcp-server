@@ -1286,7 +1286,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         **Terms are published by default.** The underlying API defaults to
         creating a *draft*, which nobody but its author can see; that is almost
         never what a caller asking to "create a term" means, so this publishes
-        unless ``publish`` is set false.
+        unless ``publish`` is set false. A draft is promoted afterwards with
+        ``update_glossary_term(publish=true)``, and is visible to
+        ``list_glossary_terms`` only under ``include_drafts``.
 
         A term's name must be unique among its siblings (case-insensitively) and
         differ from its parent's; a clash is rejected, not merged.
@@ -1301,7 +1303,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             attributes: Custom attributes keyed by label, e.g.
                 ``{"Scope": "Group", "Used in Risk": True,
                 "Regions": ["EMEA", "APAC"]}``.
-            publish: Publish immediately (default true). False leaves a draft.
+            publish: Publish immediately (default true). False leaves a draft,
+                which ``update_glossary_term(publish=true)`` promotes later.
         """
         async with viya_session("create_glossary_term", ctx) as client:
             term_type_id = await resolve_term_type_id(client, term_type)
@@ -1352,8 +1355,9 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         label: str | None = None,
         parent_id: str | None = None,
         attributes: AttributeMap | None = None,
+        publish: bool = False,
     ) -> dict[str, Any]:
-        """Update a business term's text, parent or custom attributes.
+        """Update a business term's text, parent or custom attributes — and publish a draft.
 
         The glossary API replaces the whole term on update, so this reads the
         current one first and merges your changes into it: omitting an argument
@@ -1370,6 +1374,15 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
         A term's **type** cannot be changed after creation. Its **parent** can:
         pass ``parent_id`` to move it, or ``""`` to make it a root term.
 
+        **A draft is a different resource.** A term left unpublished by
+        ``create_glossary_term(publish=false)`` can be read and deleted at the
+        ordinary path, but not written there — the service answers a plain
+        ``PUT`` on a draft with a 404. This routes the write to the draft
+        instead, so editing one works; and ``publish`` then promotes it to a
+        published term, which nothing else here could do. Publishing a term that
+        is already published is reported, not attempted: there is no draft to
+        promote and the service answers that with a 404 too.
+
         Args:
             term_id: The glossary term UUID.
             name: New name (unique among siblings, max 100 characters).
@@ -1381,6 +1394,8 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
             attributes: Custom attributes to change, keyed by label. Same value
                 forms as create_glossary_term — booleans as True/False,
                 multi-select as a list.
+            publish: Publish the term if it is still a draft (default false).
+                Pass it on its own to publish without changing anything else.
         """
         async with viya_session("update_glossary_term", ctx) as client:
             current = await get_json(f"{_GLOSSARY}/terms/{term_id}", client, accept=_TERM_MEDIA)
@@ -1418,14 +1433,36 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 body["parentId"] = parent_id or None
             body["attributes"] = merged
 
+            # A draft is a separate resource. The ordinary path answers GET and
+            # DELETE for one, which is why this reads it there, but a PUT to it
+            # is a 404 — the draft's own ``update`` link names ``/draft``, and
+            # that is the only path that can write one.
+            is_draft = bool(current.get("isDraft"))
             updated = await put_json(
-                f"{_GLOSSARY}/terms/{term_id}",
+                f"{_GLOSSARY}/terms/{term_id}/draft" if is_draft else f"{_GLOSSARY}/terms/{term_id}",
                 client,
                 body,
                 content_type=_TERM_MEDIA,
                 accept=_TERM_MEDIA,
             )
-            return {
+
+            note = ""
+            if publish and not is_draft:
+                # `/draft/state` answers a published term with a 404 (errorCode
+                # 76900), which would read as "the term is gone" rather than
+                # "there was nothing to publish".
+                note = "already published; nothing to publish."
+            elif publish:
+                promoted = await client.put(
+                    f"{VIYA_ENDPOINT}{_GLOSSARY}/terms/{term_id}/draft/state",
+                    params={"action": "publish"},
+                    headers={"Accept": _TERM_MEDIA},
+                )
+                raise_for_viya_status(promoted)
+                updated = promoted.json() if promoted.content else updated
+                is_draft = False
+
+            result = {
                 "term_id": updated.get("id", term_id),
                 "name": updated.get("name"),
                 "status": updated.get("status"),
@@ -1433,8 +1470,12 @@ def register(mcp: FastMCP, get_token: Callable[[Context], Awaitable[str]]) -> No
                 # Returned whether or not it was the thing changed: a re-parent
                 # is otherwise unconfirmable without a second call.
                 "parent_id": updated.get("parentId"),
+                "is_draft": is_draft,
                 "attributes": readable_attributes(updated.get("attributes"), by_uuid),
             }
+            if note:
+                result["note"] = note
+            return result
 
     @mcp.tool()
     async def import_glossary_terms(

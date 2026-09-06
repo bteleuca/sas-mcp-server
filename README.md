@@ -317,9 +317,9 @@ Two things about the glossary are worth knowing before you start, because both a
 - **list_table_terms**: The reverse — every column of a table and the term assigned to it, with the term's definition inline. The fastest read on whether a table is governed
 
 *Authoring:*
-- **create_glossary_term**: Create a term. **Publishes by default** — the underlying API creates an invisible draft unless told otherwise
+- **create_glossary_term**: Create a term. **Publishes by default** — the underlying API creates an invisible draft unless told otherwise; `update_glossary_term(publish=true)` promotes one later
 - **import_glossary_terms**: Create many terms, and their hierarchy, in one call. Children name their parent instead of needing its id, so rows can be given in any order and no id is threaded between levels; per-row failures are reported individually. A row is written whole, so `update_existing` *replaces* the term at that path rather than merging into it
-- **update_glossary_term**: Change a term's text, parent or attributes. Merges onto the current term, so omitted fields are left alone rather than blanked; `parent_id` moves it in the hierarchy
+- **update_glossary_term**: Change a term's text, parent or attributes. Merges onto the current term, so omitted fields are left alone rather than blanked; `parent_id` moves it in the hierarchy, and `publish` promotes a draft. A draft is a separate resource in the API, so this routes the write accordingly — editing one otherwise fails with a bare 404
 - **delete_glossary_term**: Permanently delete a term and every assignment that referenced it. There is no cascade — a term with children is refused, so delete a subtree leaf-first
 - **assign_glossary_term** / **unassign_glossary_term**: Attach a term to a table column, or detach it. This is the step that makes a term govern data — a term with no assigned assets governs nothing
 
