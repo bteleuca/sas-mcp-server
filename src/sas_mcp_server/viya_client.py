@@ -91,8 +91,16 @@ def raise_for_viya_status(resp: httpx.Response) -> None:
         detail = _viya_error_detail(resp)
         if not detail:
             raise
+        # httpx's own message spends two lines on the status phrase, the full
+        # URL and a link to the MDN page for the status code — none of which
+        # helps a model fix the call, and all of which arrives ahead of the one
+        # line that does. Keep the method, path and status; drop the rest.
+        request = exc.request
+        path = request.url.path or "/"
         raise httpx.HTTPStatusError(
-            f"{exc}\nViya reported: {detail}", request=exc.request, response=exc.response
+            f"HTTP {resp.status_code} from {request.method} {path} — Viya reported: {detail}",
+            request=request,
+            response=exc.response,
         ) from None
 
 

@@ -48,7 +48,7 @@ def test_env_var_drives_default(monkeypatch):
 
 async def test_register_all_tiers_registers_everything():
     names = await _register(None)
-    assert len(names) == 87
+    assert len(names) == 91
     assert "execute_sas_code" in names
     assert "publish_decision_flow" in names
     assert "apply_report_operations" in names
@@ -80,7 +80,7 @@ async def test_register_glossary_tier_alone():
     quiet dependency on Tier 1 having registered first.
     """
     names = await _register("9")
-    assert len(names) == 12
+    assert len(names) == 16
     assert "search_glossary_terms" in names
     assert "assign_glossary_term" in names
     assert "catalog_search" not in names  # tier 1, not 9

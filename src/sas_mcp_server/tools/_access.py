@@ -168,6 +168,12 @@ WRITE_TOOLS: frozenset[str] = frozenset(
         "create_glossary_term",
         "update_glossary_term",
         "delete_glossary_term",
+        # A term type is the template terms are created from, so these change
+        # what every term of that type must carry — not just one term.
+        "create_glossary_term_type",
+        "update_glossary_term_type",
+        "delete_glossary_term_type",
+        "import_glossary_terms",
         # Creates/removes a catalog relationship between a term and a column.
         "assign_glossary_term",
         "unassign_glossary_term",
@@ -205,6 +211,13 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset(
         # PUT replaces the whole term; the tool merges first, but a caller can
         # still overwrite a definition or an attribute that was already set.
         "update_glossary_term",
+        # Takes the attribute definitions of every term of that type with it.
+        "delete_glossary_term_type",
+        # remove_attributes drops a definition, which stops every existing
+        # term's stored value from being readable as that attribute.
+        "update_glossary_term_type",
+        # update_existing=true overwrites a term already at that path.
+        "import_glossary_terms",
     }
 )
 
@@ -227,6 +240,8 @@ IDEMPOTENT_WRITE_TOOLS: frozenset[str] = frozenset(
         "promote_table_to_memory",
         "update_glossary_term",
         "delete_glossary_term",
+        "update_glossary_term_type",
+        "delete_glossary_term_type",
         # Both check for the existing link first and report it rather than
         # creating a duplicate or failing on an absent one.
         "assign_glossary_term",
