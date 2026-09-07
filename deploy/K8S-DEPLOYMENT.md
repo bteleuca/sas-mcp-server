@@ -272,7 +272,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: server
-          image: ghcr.io/sassoftware/sas-mcp-server:1.13.0
+          image: ghcr.io/sassoftware/sas-mcp-server:1.14.0
           ports: [{ containerPort: 8134 }]
           securityContext:
             allowPrivilegeEscalation: false
