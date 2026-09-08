@@ -144,6 +144,7 @@ viya_auth = PermissiveOAuthProxy(
     upstream_token_endpoint=TOKEN_ENDPOINT,
     upstream_client_id=CLIENT_ID,
     upstream_client_secret=None,
+    token_endpoint_auth_method="none",
     jwt_signing_key=MCP_SIGNING_KEY,
     base_url=MCP_BASE_URL,
     forward_pkce=True,
