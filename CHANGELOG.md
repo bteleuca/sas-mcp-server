@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-09-09
+
 ### Fixed
 - **Browser sign-in failed at the last step on every HTTP deployment since v1.12.0.** (#54) The login completed, the callback ran, and the token exchange was then rejected by SAS Logon with `invalid_client: Missing credentials`. The FastMCP 4.0 upgrade replaced authlib's OAuth2 client with FastMCP's own, and the replacement defaults to `client_secret_basic` whether or not a client secret exists — where authlib had chosen `none` when there was none. `sas-mcp` is registered as a public client with no secret, so `upstream_client_secret=None` was interpolated into the credential and sent as `Basic base64("sas-mcp:None")`, offering the literal word "None" as the password. The proxy now declares `token_endpoint_auth_method="none"`, which is the RFC 6749 method for a public client and what authlib inferred on its own before the upgrade. Token *refresh* failed the same way and is fixed with it. stdio mode was never affected (it signs in through `auth_login.py`, which has its own token request), nor were clients presenting a raw Viya JWT with `ALLOW_RAW_BEARER`. Reported and fixed by @bteleuca.
 
