@@ -144,6 +144,16 @@ viya_auth = PermissiveOAuthProxy(
     upstream_token_endpoint=TOKEN_ENDPOINT,
     upstream_client_id=CLIENT_ID,
     upstream_client_secret=None,
+    # Keep in step with upstream_client_secret above: sas-mcp is registered as a
+    # public client (allowpublic, no secret — see examples/register_mcp_client.py),
+    # so the token exchange must present no password at all. Say so explicitly
+    # rather than leave it inferred. FastMCP 4.0 replaced authlib's OAuth2 client
+    # with its own, and the replacement defaults to client_secret_basic whether or
+    # not a secret exists, where authlib chose "none" when there was none. The
+    # None above was f-string interpolated into Basic base64("sas-mcp:None") and
+    # SAS Logon rejected every browser sign-in with "invalid_client: Missing
+    # credentials" (#54). If a client secret ever becomes configurable, this has
+    # to become conditional on it.
     token_endpoint_auth_method="none",
     jwt_signing_key=MCP_SIGNING_KEY,
     base_url=MCP_BASE_URL,
