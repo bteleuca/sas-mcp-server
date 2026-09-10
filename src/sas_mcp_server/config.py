@@ -157,6 +157,10 @@ viya_auth = PermissiveOAuthProxy(
     token_endpoint_auth_method="none",
     jwt_signing_key=MCP_SIGNING_KEY,
     base_url=MCP_BASE_URL,
+    # MCP clients use dynamically assigned localhost callback ports. Treating a
+    # URL-shaped client_id as a Client ID Metadata Document makes FastMCP reject
+    # those callbacks before the normal dynamic-registration path can handle them.
+    enable_cimd=False,
     forward_pkce=True,
     token_verifier=token_verifier,
     valid_scopes=["openid"],
